@@ -7,7 +7,8 @@ Intool (Input Tool) is a hotkey-triggered input pulser. It repeatedly presses ke
 - Actions: any key, mouse button (`mouse0`–`mouse4`), key combinations (`ctrl+z`), or scrolling
 - Action sequences: comma-separated steps with explicit `down:`/`up:`, `wait:`, relative `move:DX:DY` and exact `pos:X:Y` pointer steps
 - Hotkey sequences such as `ctrl+k, ctrl+c`
-- Recording: capture keys, mouse buttons and pointer positions into an action sequence
+- Recording: capture keys, mouse buttons and pointer positions into an action sequence, with an estimated pointer on Wayland compositors that cannot report it
+- Minimize to the system tray, a daily start and stop schedule, and opening on system startup with chosen arguments
 - Optional immediate action when the job starts, instead of after the first delay
 - Key states: **press** (hold down), **release** (let go), or **press & release** (tap with a set interval)
 - Scroll devices: **wheel** (notches), **touchpad** (smooth steps), or **pinch** (Ctrl held while scrolling)
@@ -86,8 +87,8 @@ Exact positions work on Windows and with the xtest backend. With uinput (and the
 Wayland gives applications no way to read the pointer position, so Intool combines three things:
 
 - **Placing the pointer** works everywhere: `pos:X:Y` goes through a virtual absolute pointer, which any Wayland compositor accepts through libinput. It needs the screen size (detected, or set manually).
-- **Reading the pointer** (for recording absolute positions and exact `move:` steps) uses a helper command. With `auto`, Intool tries `hyprctl cursorpos` (Hyprland) and `kdotool getmouselocation` (KDE) when installed. For anything else set **Pointer command** to a command that prints `X Y` (the first two integers are used), for example `--pointer-command "hyprctl cursorpos"`.
-- **Without a reader**, recording falls back to relative movement read from `/dev/input` (mice only; touchpads are not tracked) and is stored as `move:` steps. After a `pos:` step, later `move:` steps are tracked exactly; a sequence that starts with `move:` is sent as raw device movement, which the compositor's pointer acceleration may scale. Start such sequences with a `pos:` step for exact results.
+- **Reading the pointer** (for recording absolute positions and exact `move:` steps) uses a helper command. With `auto`, Intool tries `hyprctl cursorpos` (Hyprland), `kdotool getmouselocation` (KDE) and `wl-find-cursor -p` (Sway and other wlroots compositors, built from [wl-find-cursor](https://github.com/cjacker/wl-find-cursor)) when installed. GNOME offers no such command without a shell extension. For anything else set **Pointer command** to a command that prints `X Y` (the first two integers are used), for example `--pointer-command "hyprctl cursorpos"`.
+- **Without a reader**, recording falls back to relative movement read from `/dev/input` (mice only; touchpads are not tracked) and is stored as `move:` steps. Turn on **Estimate an unreadable pointer** (Recording Settings) to get `pos:` steps instead: Intool moves the pointer to the screen center when the recording starts, adds up the motion it reads from `/dev/input` and clamps it to the screen. The result is exact only where the compositor applies no pointer acceleration, so treat it as an approximation; a reader below is always preferred. After a `pos:` step, later `move:` steps are tracked exactly; a sequence that starts with `move:` is sent as raw device movement, which the compositor's pointer acceleration may scale. Start such sequences with a `pos:` step for exact results.
 
 Reading `/dev/input` and writing to `/dev/uinput` need the permissions described under Linux setup.
 
@@ -105,10 +106,17 @@ The gear button opens Settings:
 - **Act immediately on start**: perform the action as soon as the job starts instead of waiting for the first delay
 - **Hotkey order**: `modifiers first` fires only when the modifiers are already held; `any order` also fires when a modifier is pressed last
 - **Relative movement** and **Screen size**: see Action sequences
-- **Recording Settings** (button): recording hotkey, pointer capture (`off`, `at events`, `path` with a sample interval), coordinates (`auto`, `absolute`, `relative`), recorded waits and their minimum, leaving out the Stop Recording click, and dropping keys still held at the end
+- **Recording Settings** (button): recording hotkey, pointer capture (`off`, `at events`, `path` with a sample interval), coordinates (`auto`, `absolute`, `relative`), recorded waits and their minimum, leaving out the Stop Recording click, dropping keys still held at the end, and estimating a pointer that cannot be read
+- **System**: minimizing to the tray, the daily schedule, and opening on system startup (see below)
 - **Input backend** (Linux): Auto, uinput, xtest, or root helper
 
 The hotkey field is read-only while the listener is running. Stop the listener to change it.
+
+### Tray, schedule and startup
+
+- **Minimize to tray** hides the window in the system tray when it is minimized; the tray menu shows the window, starts or stops the job, or quits. It needs the optional `pystray` and `Pillow` packages (`pip install pystray pillow`, already included in the release builds). Without them the window minimizes normally.
+- **Start and stop on a daily schedule** starts the job at the daily start time and stops it at the daily stop time, as `HH:MM` in local time. Either time may be left empty. When Intool opens between the two times, the job starts at once. In the terminal (`-n`) Intool keeps running between runs.
+- **Open on system startup** adds Intool to the login items (`~/.config/autostart/intool.desktop` on Linux, the `Run` registry key of the current user on Windows). **Startup arguments** are passed on every start, for example `--minimized --listen` to open in the tray with the listener on, or `--minimized --start` to start the job as well; they are checked against the command line options before they are saved.
 
 Default hotkeys: press & release **F8**, press **F7**, release **F9**.
 
@@ -122,6 +130,9 @@ intool -n -S "press & release" -i 30ms -a space -s -r 5
 intool -n -a scrollup -D pinch -v 240 -d 200ms -s -r 20   # zoom in with Ctrl+wheel
 intool -n -a "pos:400:300, mouse0, wait:1s, mouse0" -s -r 1   # action sequence
 intool -n -k "ctrl+k, ctrl+c" -a mouse0 -I            # hotkey sequence, click at once on start
+intool -n --schedule --schedule-start 09:00 --schedule-stop 17:30 -a mouse0   # run every day between 09:00 and 17:30
+intool --autostart --autostart-arguments="--minimized --listen" --save   # open at login, minimized, listening
+intool -R --record-estimate                           # record pos: steps on Wayland without a pointer reader
 intool --version                                     # print the version
 intool --list-keys                                    # all key and button names
 intool --check                                        # test which Linux backends work

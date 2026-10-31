@@ -1,3 +1,4 @@
+import datetime
 import importlib.machinery
 import importlib.util
 import io
@@ -822,7 +823,291 @@ class OptionTests(unittest.TestCase):
     def test_every_option_has_a_unique_key_and_a_known_group(self):
         keys = [option.key for option in intool.OPTIONS]
         self.assertEqual(len(keys), len(set(keys)))
-        self.assertTrue({option.group for option in intool.OPTIONS} <= {"input", "recording"})
+        self.assertTrue({option.group for option in intool.OPTIONS} <= {"input", "recording", "system"})
+
+    def test_clock_parsing(self):
+        self.assertEqual(intool.parse_clock("8:05"), datetime.time(8, 5))
+        self.assertEqual(intool.parse_clock(" 23:59 "), datetime.time(23, 59))
+        self.assertIsNone(intool.parse_clock(""))
+        for text in ("24:00", "12:60", "noon", "1230", "12:5"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                intool.parse_clock(text)
+
+    def test_startup_arguments_are_validated_against_the_parser(self):
+        self.assertEqual(intool.parse_arguments("--minimized -l"), ["--minimized", "-l"])
+        self.assertEqual(intool.parse_arguments(""), [])
+        for text in ("--nope", "-S sideways", "--version", "'unterminated"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                intool.parse_arguments(text)
+
+    def test_system_options_default_to_off(self):
+        options = intool.resolve_options({})
+        self.assertFalse(options["minimize_to_tray"])
+        self.assertFalse(options["schedule"])
+        self.assertFalse(options["autostart"])
+        self.assertIsNone(options["schedule_start"])
+        self.assertEqual(options["autostart_arguments"], [])
+
+
+class MotionPointerTests(unittest.TestCase):
+    def test_motion_accumulates_from_the_origin_and_clamps_to_the_screen(self):
+        pointer = intool.MotionPointer((100, 50), (200, 100))
+        pointer.add(intool.POINTER_DX, 30)
+        pointer.add(intool.POINTER_DY, -20)
+        self.assertEqual(pointer.position(), (130, 30))
+        pointer.add(intool.POINTER_DX, 500)
+        pointer.add(intool.POINTER_DY, -500)
+        self.assertEqual(pointer.position(), (199, 0))
+
+    def test_recorder_turns_estimated_motion_into_absolute_steps(self):
+        pointer = intool.MotionPointer((100, 100), (800, 600))
+        ticks = iter([0.0, 0.1])
+        recorder = intool.Recorder(pointer, clock=lambda: next(ticks))
+        self.assertTrue(recorder.wants_motion)
+        recorder.motion(intool.POINTER_DX, 25)
+        recorder.motion(intool.POINTER_DY, -10)
+        recorder.feed(intool.KEYS["a"], 1)
+        recorder.feed(intool.KEYS["a"], 0)
+        self.assertEqual(recorder.finish(), "pos:125:90, down:a, wait:100ms, up:a")
+
+    def test_relative_coordinates_ignore_the_estimator(self):
+        pointer = intool.MotionPointer((10, 10), (800, 600))
+        recorder = intool.Recorder(pointer, options=intool.RecordOptions(coordinates="relative"))
+        recorder.motion(intool.POINTER_DX, 5)
+        self.assertEqual(pointer.position(), (15, 10))
+
+    def test_other_pointers_do_not_integrate_motion(self):
+        recorder = intool.Recorder(FakePointer())
+        self.assertFalse(recorder.wants_motion)
+
+
+class SchedulerTests(unittest.TestCase):
+    def at(self, hour, minute=0, day=1):
+        return datetime.datetime(2026, 11, day, hour, minute)
+
+    def test_next_occurrence_is_today_or_tomorrow(self):
+        moment = datetime.time(9, 0)
+        self.assertEqual(intool.next_occurrence(self.at(8, 30), moment), self.at(9))
+        self.assertEqual(intool.next_occurrence(self.at(9), moment), self.at(9, day=2))
+        self.assertEqual(intool.next_occurrence(self.at(23, 59), moment), self.at(9, day=2))
+
+    def test_window_covers_same_day_and_overnight_ranges(self):
+        day = (datetime.time(9), datetime.time(17))
+        night = (datetime.time(22), datetime.time(6))
+        self.assertTrue(intool.in_window(self.at(12), *day))
+        self.assertFalse(intool.in_window(self.at(17), *day))
+        self.assertTrue(intool.in_window(self.at(23), *night))
+        self.assertTrue(intool.in_window(self.at(5), *night))
+        self.assertFalse(intool.in_window(self.at(12), *night))
+        self.assertFalse(intool.in_window(self.at(12), None, day[1]))
+        self.assertFalse(intool.in_window(self.at(12), day[0], day[0]))
+
+    def run_scheduler(self, now, start, stop, fires):
+        clock = [now]
+        fired = []
+        scheduler = intool.Scheduler(start, stop, lambda action: fired.append(action), now=lambda: clock[0])
+
+        def advance(timeout):
+            clock[0] += datetime.timedelta(seconds=timeout)
+            return len(fired) >= fires
+
+        scheduler._halt.wait = advance
+        scheduler._run()
+        return fired
+
+    def test_fires_start_and_stop_every_day(self):
+        fired = self.run_scheduler(self.at(8), datetime.time(9), datetime.time(17), 4)
+        self.assertEqual(fired, ["start", "stop", "start", "stop"])
+
+    def test_starts_at_once_when_launched_inside_the_window(self):
+        fired = self.run_scheduler(self.at(12), datetime.time(9), datetime.time(17), 2)
+        self.assertEqual(fired, ["start", "stop"])
+
+    def test_a_single_time_is_enough(self):
+        fired = self.run_scheduler(self.at(8), None, datetime.time(17), 2)
+        self.assertEqual(fired, ["stop", "stop"])
+
+    def test_engine_creates_and_replaces_the_scheduler_only_when_the_plan_changes(self):
+        engine = EngineTests.FakeEngine()
+        created = []
+
+        class FakeScheduler:
+            def __init__(self, start, stop, fire):
+                self.args = (start, stop)
+                self.closed = False
+                created.append(self)
+
+            def begin(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        with mock.patch.object(intool, "Scheduler", FakeScheduler):
+            engine.configure({"schedule": True, "schedule_start": "09:00"})
+            self.assertTrue(engine.scheduled)
+            engine.configure({"schedule": True, "schedule_start": "09:00", "record_waits": False})
+            self.assertEqual(len(created), 1)
+            engine.configure({"schedule": True, "schedule_start": "10:00"})
+            self.assertEqual(len(created), 2)
+            self.assertTrue(created[0].closed)
+            engine.configure({"schedule": False, "schedule_start": "10:00"})
+            self.assertFalse(engine.scheduled)
+            self.assertTrue(created[1].closed)
+
+    def test_schedule_without_times_creates_nothing(self):
+        engine = EngineTests.FakeEngine()
+        engine.configure({"schedule": True})
+        self.assertFalse(engine.scheduled)
+
+    def test_scheduler_events_reach_the_engine_listener(self):
+        engine = EngineTests.FakeEngine()
+        events = []
+        engine.notify = lambda event, *args: events.append((event, args))
+        now = datetime.datetime.now()
+        soon = (now + datetime.timedelta(minutes=1)).time().replace(second=0, microsecond=0)
+        later = (now + datetime.timedelta(minutes=2)).time().replace(second=0, microsecond=0)
+        engine.configure({"schedule": True, "schedule_start": soon.strftime("%H:%M"),
+                          "schedule_stop": later.strftime("%H:%M")})
+        self.assertTrue(engine.scheduled)
+        engine.shutdown()
+        self.assertFalse(engine.scheduled)
+
+
+class AutostartTests(unittest.TestCase):
+    def test_desktop_quote_follows_the_desktop_entry_rules(self):
+        self.assertEqual(intool.desktop_quote("/usr/bin/python3"), "/usr/bin/python3")
+        self.assertEqual(intool.desktop_quote("a b"), '"a b"')
+        self.assertEqual(intool.desktop_quote("50%"), '"50%%"')
+        self.assertEqual(intool.desktop_quote('say "hi"$'), '"say \\"hi\\"\\$"')
+        self.assertEqual(intool.desktop_quote("a\\b"), '"a\\\\\\\\b"')
+
+    def test_launch_command_adds_the_config_only_when_it_is_not_the_default(self):
+        default = intool.launch_command(intool.default_config_path())
+        self.assertNotIn("--config", default)
+        custom = intool.launch_command(os.path.abspath("other.json"))
+        self.assertEqual(custom[-2:], ["--config", os.path.abspath("other.json")])
+
+    def test_frozen_builds_launch_the_executable_itself(self):
+        with mock.patch.object(intool.sys, "frozen", True, create=True):
+            self.assertEqual(intool.launch_command(intool.default_config_path()), [intool.sys.executable])
+
+    def options(self, **overrides):
+        return {**intool.resolve_options({}), **overrides}
+
+    def test_desktop_entry_is_written_and_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "autostart", "intool.desktop")
+            with mock.patch.object(intool, "autostart_path", return_value=target), \
+                    mock.patch.object(intool, "IS_WIN", False), mock.patch.object(intool, "IS_LINUX", True):
+                intool.sync_autostart(
+                    self.options(autostart=True, autostart_arguments=["--minimized", "-l"]),
+                    intool.default_config_path(),
+                )
+                text = Path(target).read_text()
+                self.assertIn("[Desktop Entry]", text)
+                self.assertTrue(next(l for l in text.splitlines() if l.startswith("Exec=")).endswith("--minimized -l"))
+                intool.sync_autostart(self.options(), intool.default_config_path())
+                self.assertFalse(os.path.exists(target))
+                intool.sync_autostart(self.options(), intool.default_config_path())
+
+    def test_windows_run_key_is_set_and_deleted(self):
+        registry = mock.MagicMock()
+        registry.OpenKey.return_value.__enter__.return_value = "key"
+        with mock.patch.dict("sys.modules", {"winreg": registry}), \
+                mock.patch.object(intool, "IS_WIN", True), mock.patch.object(intool, "IS_LINUX", False):
+            intool.sync_autostart(self.options(autostart=True), intool.default_config_path())
+            name, _, kind, value = registry.SetValueEx.call_args[0][1:]
+            self.assertEqual((name, kind), (intool.APP_NAME, registry.REG_SZ))
+            self.assertIn(os.path.abspath(intool.__file__) if not getattr(intool.sys, "frozen", False) else "", value)
+            intool.sync_autostart(self.options(), intool.default_config_path())
+            registry.DeleteValue.assert_called_once_with("key", intool.APP_NAME)
+
+    def test_unsupported_platforms_refuse_to_enable_it(self):
+        with mock.patch.object(intool, "IS_WIN", False), mock.patch.object(intool, "IS_LINUX", False):
+            with self.assertRaises(intool.BackendError):
+                intool.sync_autostart(self.options(autostart=True), intool.default_config_path())
+            intool.sync_autostart(self.options(), intool.default_config_path())
+
+    def test_save_flag_writes_the_startup_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = os.path.join(tmp, "config.json")
+            with mock.patch.object(intool, "sync_autostart") as sync, \
+                    mock.patch.object(intool, "run_headless", return_value=0):
+                intool.main(["-n", "--save", "--config", config, "--autostart", "--autostart-arguments=--minimized"])
+            options, path = sync.call_args[0]
+            self.assertTrue(options["autostart"])
+            self.assertEqual(options["autostart_arguments"], ["--minimized"])
+            self.assertEqual(path, os.path.abspath(config))
+            self.assertTrue(intool.read_config(config)["autostart"])
+
+
+class TrayTests(unittest.TestCase):
+    class FakeIcon:
+        def __init__(self, name, picture, title, menu):
+            self.menu = menu
+            self.running = False
+            self.stopped = False
+
+        def run_detached(self):
+            self.running = True
+
+        def stop(self):
+            self.stopped = True
+
+    class FakeImage:
+        @staticmethod
+        def new(mode, size, color):
+            return (mode, size, color)
+
+    class FakeDraw:
+        @staticmethod
+        def Draw(picture):
+            return types.SimpleNamespace(ellipse=lambda box, fill: None)
+
+    def backend(self):
+        pystray = types.SimpleNamespace(
+            Icon=self.FakeIcon, Menu=lambda *items: items,
+            MenuItem=lambda text, action, default=False: (text, action, default),
+        )
+        return pystray, self.FakeImage, self.FakeDraw
+
+    def test_show_without_the_packages_reports_failure(self):
+        tray = intool.Tray(None, None, None, loader=lambda: None)
+        self.assertFalse(tray.show())
+        self.assertIsNone(tray.icon)
+        tray.hide()
+
+    def test_show_creates_one_icon_with_the_menu_and_hide_stops_it(self):
+        calls = []
+        tray = intool.Tray(lambda: calls.append("show"), lambda: calls.append("toggle"),
+                           lambda: calls.append("quit"), loader=self.backend)
+        self.assertTrue(tray.show())
+        icon = tray.icon
+        self.assertTrue(icon.running)
+        self.assertTrue(tray.show())
+        self.assertIs(tray.icon, icon)
+        for _, action, _ in icon.menu:
+            action()
+        self.assertEqual(calls, ["show", "toggle", "quit"])
+        self.assertEqual([default for _, _, default in icon.menu], [True, False, False])
+        tray.hide()
+        self.assertTrue(icon.stopped)
+        self.assertIsNone(tray.icon)
+
+    def test_a_failing_backend_falls_back_cleanly(self):
+        class Broken(self.FakeIcon):
+            def run_detached(self):
+                raise RuntimeError("no display")
+
+        pystray, image, draw = self.backend()
+        pystray.Icon = Broken
+        tray = intool.Tray(None, None, None, loader=lambda: (pystray, image, draw))
+        self.assertFalse(tray.show())
+
+    def test_missing_modules_make_the_loader_return_none(self):
+        with mock.patch.dict("sys.modules", {"pystray": None}):
+            self.assertIsNone(intool.load_tray_backend())
 
 
 class RecorderModeTests(unittest.TestCase):
@@ -1501,6 +1786,73 @@ class EngineTests(unittest.TestCase):
         step = spec("press", [30])
         self.assertIs(engine._resolve_move(step), step)
 
+    def test_estimated_pointer_warps_to_the_screen_center_first(self):
+        engine = self.FakeEngine()
+        engine.configure({"record_estimate": True, "screen": "800x600"})
+        engine._screen = (800, 600)
+        warped = []
+        engine._execute = warped.append
+        engine._open_source = lambda: self.FakeSource([])
+        with mock.patch.object(intool, "open_pointer", return_value=None):
+            self.assertTrue(engine.start_recording())
+            self.assertEqual(warped, [{"kind": "pos", "payload": (400, 300)}])
+            self.assertTrue(engine._recorder.wants_motion)
+            self.assertIsInstance(engine._recorder.pointer, intool.MotionPointer)
+            engine.stop_recording()
+
+    def test_a_readable_pointer_is_preferred_over_the_estimate(self):
+        engine = self.FakeEngine()
+        engine.configure({"record_estimate": True})
+        engine._open_source = lambda: self.FakeSource([])
+        engine._execute = lambda spec: self.fail("must not warp")
+        with mock.patch.object(intool, "open_pointer", return_value=FakePointer()):
+            self.assertTrue(engine.start_recording())
+            self.assertNotIsInstance(engine._recorder.pointer, intool.MotionPointer)
+            engine.stop_recording()
+
+    def test_estimate_is_skipped_for_relative_coordinates_and_when_disabled(self):
+        for values in ({"record_estimate": True, "record_coordinates": "relative"}, {}):
+            with self.subTest(values=values):
+                engine = self.FakeEngine()
+                engine.configure(values)
+                engine._open_source = lambda: self.FakeSource([])
+                engine._execute = lambda spec: self.fail("must not warp")
+                with mock.patch.object(intool, "open_pointer", return_value=None):
+                    self.assertTrue(engine.start_recording())
+                    self.assertIsNone(engine._recorder.pointer)
+                    engine.stop_recording()
+
+    def test_estimate_without_a_screen_size_is_a_recording_error(self):
+        engine = self.FakeEngine()
+        engine.configure({"record_estimate": True})
+        events = []
+        engine.notify = lambda event, *args: events.append((event, args))
+        with mock.patch.object(intool, "open_pointer", return_value=None), \
+                mock.patch.object(intool, "probe_screen", return_value=None):
+            self.assertFalse(engine.start_recording())
+        self.assertFalse(engine.recording)
+        self.assertEqual(events[0][0], "error")
+        self.assertIn("screen size", events[0][1][1])
+
+    def test_a_failing_warp_is_a_recording_error(self):
+        engine = self.FakeEngine()
+        engine.configure({"record_estimate": True})
+        engine._screen = (800, 600)
+        events = []
+        engine.notify = lambda event, *args: events.append(event)
+
+        def fail(spec):
+            raise OSError("uinput closed")
+
+        engine._execute = fail
+        with mock.patch.object(intool, "open_pointer", return_value=None):
+            self.assertFalse(engine.start_recording())
+        self.assertEqual(events, ["error"])
+
+    def test_wlroots_cursor_reader_is_tried_after_the_other_compositors(self):
+        names = [argv[0] for argv in intool.WAYLAND_POINTER_COMMANDS]
+        self.assertEqual(names, ["hyprctl", "kdotool", "wl-find-cursor"])
+
     def test_recording_hotkey_starts_and_stops_a_recording(self):
         engine = self.FakeEngine()
         events = []
@@ -1762,6 +2114,75 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(intool.job_from_fields(self.app.current_fields(), need_hotkey=False).immediate)
         self.app.delete_config()
         self.assertFalse(self.app.immediate_var.get())
+
+    def test_unmap_hides_to_the_tray_only_when_enabled_and_available(self):
+        shown = []
+        self.app.tray.show = lambda: shown.append(True) or True
+        self.app.root.state = lambda *args: "iconic"
+        event = types.SimpleNamespace(widget=self.app.root)
+        self.app._on_unmap(event)
+        self.assertEqual(shown, [])
+        self.app.option_vars["minimize_to_tray"].set(True)
+        self.app._on_unmap(event)
+        self.assertTrue(shown)
+        self.assertEqual(self.app.root.wm_state(), "withdrawn")
+
+    def test_minimize_falls_back_to_a_plain_minimize_without_a_tray(self):
+        self.app.option_vars["minimize_to_tray"].set(True)
+        self.app.tray.show = lambda: False
+        iconified = []
+        self.app.root.iconify = lambda: iconified.append(True)
+        self.app.minimize()
+        self.assertEqual(iconified, [True])
+        self.assertNotEqual(self.app.root.wm_state(), "withdrawn")
+
+    def test_restore_shows_the_window_and_removes_the_icon(self):
+        hidden = []
+        self.app.tray.hide = lambda: hidden.append(True)
+        self.app.root.withdraw()
+        self.app.restore_window()
+        self.assertEqual(hidden, [True])
+        self.assertEqual(self.app.root.wm_state(), "normal")
+
+    def test_scheduled_events_start_and_stop_the_job(self):
+        calls = []
+        self.app.start_clicking = lambda: calls.append("start")
+        self.app.engine.stop = lambda: calls.append("stop")
+        self.app._handle_engine_event("scheduled", "start")
+        self.app._handle_engine_event("scheduled", "stop")
+        self.assertEqual(calls, ["start", "stop"])
+
+    def test_system_settings_are_saved_and_applied(self):
+        synced = []
+        with mock.patch.object(intool, "sync_autostart", lambda options, path: synced.append(options)):
+            self.app.option_vars["autostart"].set(True)
+            self.app.option_vars["autostart_arguments"].set("--minimized")
+            self.app.option_vars["schedule"].set(True)
+            self.app.option_vars["schedule_start"].set("09:00")
+            self.app.commit_settings()
+        saved = intool.read_config(self.config)
+        self.assertEqual((saved["schedule_start"], saved["autostart"]), ("09:00", True))
+        self.assertTrue(self.app.engine.scheduled)
+        self.assertEqual(synced[-1]["autostart_arguments"], ["--minimized"])
+
+    def test_invalid_startup_settings_are_rejected(self):
+        for key, value in (("schedule_start", "9am"), ("autostart_arguments", "--bogus")):
+            with self.subTest(key=key):
+                self.app.option_vars[key].set(value)
+                self.app.commit_settings()
+                self.root.update()
+                self.assertFalse(os.path.exists(self.config))
+                self.app.option_vars[key].set("")
+
+    def test_startup_errors_are_shown_but_settings_still_saved(self):
+        def fail(options, path):
+            raise OSError("read-only")
+
+        with mock.patch.object(intool, "sync_autostart", fail):
+            self.app.option_vars["autostart"].set(True)
+            self.app.commit_settings()
+        self.root.update()
+        self.assertTrue(intool.read_config(self.config)["autostart"])
 
     def test_save_config_writes_hotkeys_and_options(self):
         self.app.save_config()

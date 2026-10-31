@@ -1,7 +1,10 @@
 import argparse
+import contextlib
 import ctypes
 import ctypes.util
+import datetime
 import glob
+import io
 import json
 import math
 import os
@@ -35,6 +38,8 @@ APP_NAME = "Intool"
 APP_DIRNAME = "Intool"
 VERSION = "1.0.0"
 VIRTUAL_NAME = "Intool Virtual Device"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_FILE = "intool.desktop"
 RESCAN_SECONDS = 3.0
 DRAIN_READS = 256
 SCROLL_NOTCH = 120
@@ -425,6 +430,31 @@ def parse_command(text):
         raise ValueError(str(exc)) from None
 
 
+def parse_clock(text):
+    s = (text or "").strip()
+    if not s:
+        return None
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
+    if not match or int(match[1]) > 23 or int(match[2]) > 59:
+        raise ValueError("use HH:MM, for example 08:30, or leave it empty")
+    return datetime.time(int(match[1]), int(match[2]))
+
+
+def parse_arguments(text):
+    try:
+        argv = shlex.split(text or "")
+    except ValueError as exc:
+        raise ValueError(str(exc)) from None
+    errors = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
+            build_parser().parse_args(argv)
+    except SystemExit:
+        lines = errors.getvalue().strip().splitlines()
+        raise ValueError(re.sub(r"^.*error: ", "", lines[-1]) if lines else "not allowed here") from None
+    return argv
+
+
 @dataclass(frozen=True)
 class Option:
     key: str
@@ -468,6 +498,16 @@ OPTIONS = (
     Option("record_path_interval", "Path sample interval", "50ms", parse=parse_duration, group="recording"),
     Option("record_trim_click", "Leave out the Stop Recording click", True, "bool", group="recording"),
     Option("record_drop_held", "Drop keys still held at the end", True, "bool", group="recording"),
+    Option("record_estimate", "Estimate an unreadable pointer from motion (starts at the screen center)",
+           False, "bool", group="recording"),
+    Option("minimize_to_tray", "Minimize to tray (needs the pystray and Pillow packages)", False, "bool",
+           group="system"),
+    Option("schedule", "Start and stop on a daily schedule", False, "bool", group="system"),
+    Option("schedule_start", "Daily start time (HH:MM, empty = none)", "", parse=parse_clock, group="system"),
+    Option("schedule_stop", "Daily stop time (HH:MM, empty = none)", "", parse=parse_clock, group="system"),
+    Option("autostart", "Open on system startup", False, "bool", group="system"),
+    Option("autostart_arguments", "Startup arguments (for example --minimized --listen)", "",
+           parse=parse_arguments, group="system"),
 )
 
 
@@ -499,6 +539,10 @@ def resolve_hotkeys(data, state):
     return hotkeys
 
 
+def xdg_config_home():
+    return os.environ.get("XDG_CONFIG_HOME") or joinp(os.path.expanduser("~"), ".config")
+
+
 def default_config_dir():
     home = os.path.expanduser("~")
     if IS_WIN:
@@ -506,8 +550,7 @@ def default_config_dir():
         return joinp(base, APP_DIRNAME)
     if sys.platform == "darwin":
         return joinp(home, "Library", "Application Support", APP_DIRNAME)
-    base = os.environ.get("XDG_CONFIG_HOME") or joinp(home, ".config")
-    return joinp(base, "intool")
+    return joinp(xdg_config_home(), "intool")
 
 
 def default_config_path():
@@ -533,6 +576,74 @@ def write_config(path, data):
         return True
     except OSError:
         return False
+
+
+def launch_command(config_path):
+    if getattr(sys, "frozen", False):
+        command = [sys.executable]
+    else:
+        interpreter = sys.executable
+        if IS_WIN:
+            windowed = joinp(os.path.dirname(interpreter), "pythonw.exe")
+            interpreter = windowed if os.path.exists(windowed) else interpreter
+        command = [interpreter, os.path.abspath(__file__)]
+    if os.path.abspath(config_path) != default_config_path():
+        command += ["--config", os.path.abspath(config_path)]
+    return command
+
+
+def desktop_quote(argument):
+    if re.fullmatch(r"[A-Za-z0-9_@+=:,./-]+", argument):
+        return argument
+    escaped = argument.replace("\\", "\\\\\\\\").replace("%", "%%")
+    escaped = re.sub(r'(["`$])', r"\\\1", escaped)
+    return f'"{escaped}"'
+
+
+def autostart_path():
+    return joinp(xdg_config_home(), "autostart", AUTOSTART_FILE)
+
+
+def write_desktop_entry(command):
+    path = autostart_path()
+    if command is None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return
+    lines = [
+        "[Desktop Entry]", "Type=Application", f"Name={APP_NAME}",
+        "Exec=" + " ".join(desktop_quote(argument) for argument in command),
+        "Terminal=false", "",
+    ]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def write_run_key(command):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if command is None:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+        else:
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, subprocess.list2cmdline(command))
+
+
+def sync_autostart(options, config_path):
+    command = None
+    if options["autostart"]:
+        command = launch_command(config_path) + options["autostart_arguments"]
+    if IS_WIN:
+        write_run_key(command)
+    elif IS_LINUX:
+        write_desktop_entry(command)
+    elif command is not None:
+        raise BackendError("starting on system startup is not supported on this platform")
 
 
 def detect_system_theme():
@@ -1402,13 +1513,14 @@ class RecordOptions:
     path_interval: float = 0.05
     trim_click: bool = True
     drop_held: bool = True
+    estimate: bool = False
 
     @classmethod
     def from_options(cls, options):
         return cls(
             options["record_pointer"], options["record_coordinates"], options["record_waits"],
             options["record_min_wait"], max(0.005, options["record_path_interval"]),
-            options["record_trim_click"], options["record_drop_held"],
+            options["record_trim_click"], options["record_drop_held"], options["record_estimate"],
         )
 
 
@@ -1430,7 +1542,8 @@ class Recorder:
         self.done = False
         self.tracking = self.options.pointer != "off"
         self.absolute = pointer is not None and self.options.coordinates != "relative"
-        self.wants_motion = self.tracking and pointer is None
+        self.integrates = getattr(pointer, "integrates", False)
+        self.wants_motion = self.tracking and (pointer is None or self.integrates)
         if self.tracking and pointer is not None and not self.absolute:
             self.location = tuple(pointer.position())
 
@@ -1439,7 +1552,11 @@ class Recorder:
 
     def motion(self, code, value):
         with self.lock:
-            if self.wants_motion and not self.done:
+            if not self.wants_motion or self.done:
+                return
+            if self.integrates:
+                self.pointer.add(code, value)
+            else:
                 self.pending[0 if code == POINTER_DX else 1] += value
 
     def _stamp(self, now):
@@ -1556,7 +1673,29 @@ def format_step(step):
     return f"{kind}:" + "+".join(CODE_NAMES[code] for code in payload)
 
 
-WAYLAND_POINTER_COMMANDS = (("hyprctl", "cursorpos"), ("kdotool", "getmouselocation"))
+WAYLAND_POINTER_COMMANDS = (
+    ("hyprctl", "cursorpos"), ("kdotool", "getmouselocation"), ("wl-find-cursor", "-p"),
+)
+
+
+class MotionPointer:
+    integrates = True
+
+    def __init__(self, origin, size):
+        self.size = size
+        self.x, self.y = origin
+
+    def add(self, code, value):
+        if code == POINTER_DX:
+            self.x = min(max(self.x + value, 0), self.size[0] - 1)
+        else:
+            self.y = min(max(self.y + value, 0), self.size[1] - 1)
+
+    def position(self):
+        return self.x, self.y
+
+    def close(self):
+        pass
 
 
 class CommandPointer:
@@ -1713,6 +1852,53 @@ def probe_screen():
         probe.close()
 
 
+def next_occurrence(now, moment):
+    target = now.replace(hour=moment.hour, minute=moment.minute, second=0, microsecond=0)
+    return target if target > now else target + datetime.timedelta(days=1)
+
+
+def in_window(now, start, stop):
+    if start is None or stop is None or start == stop:
+        return False
+    current = now.time()
+    if start < stop:
+        return start <= current < stop
+    return current >= start or current < stop
+
+
+class Scheduler:
+    TICK = 30.0
+
+    def __init__(self, start, stop, fire, now=datetime.datetime.now):
+        self.moments = (("start", start), ("stop", stop))
+        self.fire = fire
+        self.now = now
+        self._halt = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def begin(self):
+        self._thread.start()
+
+    def close(self):
+        self._halt.set()
+
+    def _upcoming(self, now):
+        return min(
+            (next_occurrence(now, moment), action) for action, moment in self.moments if moment is not None
+        )
+
+    def _run(self):
+        start, stop = (moment for _, moment in self.moments)
+        if in_window(self.now(), start, stop):
+            self.fire("start")
+        while not self._halt.is_set():
+            due, action = self._upcoming(self.now())
+            while self.now() < due:
+                if self._halt.wait(min(self.TICK, (due - self.now()).total_seconds())):
+                    return
+            self.fire(action)
+
+
 class Engine:
     def __init__(self, notify, backend="Auto", on_hotkey=None):
         self.notify = notify
@@ -1734,6 +1920,8 @@ class Engine:
         self._monitor_running = False
         self._cursor = None
         self._locator = None
+        self._scheduler = None
+        self._schedule = None
         self._stop = threading.Event()
         self._lock = threading.RLock()
         self.configure({})
@@ -1758,6 +1946,33 @@ class Engine:
         if self.linux and options["screen"] != self._screen:
             self._screen = options["screen"]
             self.linux.set_screen(self._screen)
+        self._apply_schedule(options)
+
+    @property
+    def scheduled(self):
+        return self._scheduler is not None
+
+    def _apply_schedule(self, options):
+        plan = (options["schedule"], options["schedule_start"], options["schedule_stop"])
+        if plan == self._schedule:
+            return
+        self._schedule = plan
+        if self._scheduler is not None:
+            self._scheduler.close()
+            self._scheduler = None
+        enabled, start, stop = plan
+        if enabled and (start or stop):
+            self._scheduler = Scheduler(start, stop, lambda action: self._emit("scheduled", action))
+            self._scheduler.begin()
+
+    def _estimate_pointer(self):
+        size = self._screen or probe_screen()
+        if size is None:
+            raise BackendError("Estimating the pointer needs the screen size; set Screen size in Settings.")
+        origin = (size[0] // 2, size[1] // 2)
+        self._execute({"kind": "pos", "payload": origin})
+        self._cursor = origin
+        return MotionPointer(origin, size)
 
     def _locate(self):
         if self._cursor is not None:
@@ -2003,13 +2218,15 @@ class Engine:
             try:
                 if options.pointer != "off":
                     pointer = open_pointer(self.pointer_command)
+                    if pointer is None and options.estimate and options.coordinates != "relative":
+                        pointer = self._estimate_pointer()
                     if pointer is None and options.coordinates == "absolute":
                         raise BackendError(
                             "Absolute pointer positions are not available here; "
                             "use Pointer coordinates: auto or relative."
                         )
                 recorder = Recorder(pointer, options=options)
-            except BackendError as exc:
+            except (BackendError, OSError) as exc:
                 if pointer is not None:
                     pointer.close()
                 self._emit("error", "Recording Error", str(exc))
@@ -2039,6 +2256,9 @@ class Engine:
             self.recording = False
         if recorder is not None:
             recorder.finish()
+        if self._scheduler is not None:
+            self._scheduler.close()
+            self._scheduler = None
         self.stop()
         if self._locator is not None:
             self._locator.close()
@@ -2047,13 +2267,62 @@ class Engine:
             self.linux.shutdown()
 
 
+def load_tray_backend():
+    try:
+        import pystray
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+    return pystray, Image, ImageDraw
+
+
+class Tray:
+    def __init__(self, on_show, on_toggle, on_quit, loader=load_tray_backend):
+        self.callbacks = (on_show, on_toggle, on_quit)
+        self.loader = loader
+        self.icon = None
+
+    def show(self):
+        if self.icon is not None:
+            return True
+        backend = self.loader()
+        if backend is None:
+            return False
+        pystray, image_module, draw_module = backend
+        on_show, on_toggle, on_quit = self.callbacks
+        picture = image_module.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw_module.Draw(picture).ellipse((6, 6, 58, 58), fill=(88, 166, 255, 255))
+        menu = pystray.Menu(
+            pystray.MenuItem("Show", lambda *_: on_show(), default=True),
+            pystray.MenuItem("Start / Stop", lambda *_: on_toggle()),
+            pystray.MenuItem("Quit", lambda *_: on_quit()),
+        )
+        icon = pystray.Icon(APP_NAME.lower(), picture, APP_NAME, menu)
+        try:
+            icon.run_detached()
+        except Exception:
+            return False
+        self.icon = icon
+        return True
+
+    def hide(self):
+        icon, self.icon = self.icon, None
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+
+
 class App:
-    def __init__(self, root, config_path=None, overrides=None, auto_listen=False, auto_start=False):
+    def __init__(self, root, config_path=None, overrides=None, auto_listen=False, auto_start=False,
+                 start_minimized=False):
         self.root = root
         self.root.title(APP_NAME)
         self.root.resizable(True, True)
         self.auto_listen = auto_listen
         self.auto_start = auto_start
+        self.start_minimized = start_minimized
 
         self._themed = []
         self._combos = []
@@ -2091,6 +2360,11 @@ class App:
             on_hotkey=lambda: self._engine_event("hotkey"),
         )
         self.engine.configure(options)
+        self.tray = Tray(
+            lambda: self._soon(self.restore_window),
+            lambda: self._soon(self.toggle_clicking),
+            lambda: self._soon(self.on_closing),
+        )
 
         self.resolve_and_apply_theme()
         self.build_ui()
@@ -2101,8 +2375,11 @@ class App:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.bind_all("<Button-1>", self._on_root_click, add="+")
+        self.root.bind("<Unmap>", self._on_unmap, add="+")
         self._apply_saved_geometry()
 
+        if self.start_minimized:
+            self.root.after(200, self.minimize)
         if self.auto_listen:
             self.root.after(150, self.toggle_listener)
         if self.auto_start:
@@ -2113,6 +2390,38 @@ class App:
             self.root.after(0, self._handle_engine_event, event, *args)
         except (tk.TclError, RuntimeError):
             pass
+
+    def _soon(self, action):
+        try:
+            self.root.after(0, action)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def hide_to_tray(self):
+        if not self.option_vars["minimize_to_tray"].get() or not self.tray.show():
+            return False
+        self.root.withdraw()
+        return True
+
+    def minimize(self):
+        if not self.hide_to_tray():
+            self.root.iconify()
+
+    def restore_window(self):
+        self.tray.hide()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _on_unmap(self, event):
+        if event.widget is self.root and self.root.state() == "iconic":
+            self.hide_to_tray()
+
+    def run_schedule(self, action):
+        if action == "start":
+            self.start_clicking()
+        else:
+            self.engine.stop()
 
     def _handle_engine_event(self, event, *args):
         if event == "state":
@@ -2125,6 +2434,8 @@ class App:
             self.apply_recording(args[0])
         elif event == "hotkey":
             self.toggle_clicking()
+        elif event == "scheduled":
+            self.run_schedule(args[0])
 
     def _themed_widget(self, widget, kind):
         self._themed.append((widget, kind))
@@ -2469,6 +2780,9 @@ class App:
         row = self._section(frame, "Advanced", row)
         row = self._option_rows(frame, "input", row)
 
+        row = self._section(frame, "System", row)
+        row = self._option_rows(frame, "system", row)
+
         row = self._section(frame, "Manage", row)
         self._action_row(frame, row, (
             ("Recording Settings", self.open_recording_settings),
@@ -2507,12 +2821,19 @@ class App:
     def option_values(self):
         return {key: variable.get() for key, variable in self.option_vars.items()}
 
+    def apply_autostart(self):
+        try:
+            sync_autostart(resolve_options(self.option_values()), self.configs)
+        except (OSError, BackendError, ValueError) as exc:
+            self.show_error_popup("Startup Error", str(exc))
+
     def commit_settings(self):
         try:
             self.engine.configure(self.option_values())
         except ValueError as exc:
             self.show_error_popup("Invalid Setting", str(exc))
             return
+        self.apply_autostart()
         self.save_config()
 
     def on_theme_change(self, event):
@@ -2875,6 +3196,7 @@ class App:
         for option in OPTIONS:
             self.option_vars[option.key].set(option.clean(None))
         self.engine.configure(self.option_values())
+        self.apply_autostart()
         self.hotkeys = dict(DEFAULT_HOTKEYS)
         self.set_entry("hotkey", self.hotkeys[self.state_selection])
         self.update_hotkey_title()
@@ -2887,6 +3209,7 @@ class App:
 
     def on_closing(self):
         self.save_config()
+        self.tray.hide()
         self.engine.shutdown()
         self.root.destroy()
 
@@ -2979,6 +3302,12 @@ def run_headless(fields, backend, listen, start, quiet):
             log(f"{args[0]}: {args[1]}", err=True)
         elif event == "finished":
             say("finished")
+        elif event == "scheduled":
+            say(f"schedule: {args[0]}")
+            if args[0] == "start":
+                engine.start(job)
+            else:
+                engine.stop()
         elif event == "state":
             if engine.running != seen["running"]:
                 seen["running"] = engine.running
@@ -2986,7 +3315,7 @@ def run_headless(fields, backend, listen, start, quiet):
             if engine.listening != seen["listening"]:
                 seen["listening"] = engine.listening
                 say(f"listening for '{fields['hotkey']}'" if engine.listening else "listener stopped")
-            if not engine.running and not engine.listening:
+            if not engine.running and not engine.listening and not engine.scheduled:
                 done.set()
 
     engine = Engine(notify, backend)
@@ -3149,6 +3478,8 @@ def build_parser():
             "  intool.pyw -R --save                             record until F10, keep it as the action\n"
             "  intool.pyw -n -s -r 1 -I                         play the saved action once\n"
             "  intool.pyw -a e -d 250ms -l                      open the GUI prefilled, listener on\n"
+            "  intool.pyw -n --schedule --schedule-start 09:00 --schedule-stop 17:30   run daily\n"
+            "  intool.pyw --autostart --autostart-arguments=\"--minimized -l\" --save   open at login\n"
             "  intool.pyw --check                               test which Linux backends work here\n"
         ),
     )
@@ -3162,6 +3493,8 @@ def build_parser():
     mode.add_argument("-R", "--record", nargs="?", const=0.0, default=None, type=duration, metavar="TIME",
                       help="record keys, buttons and pointer into an action, print it, then exit; "
                            "stops at the recording hotkey, Ctrl+C or after TIME (use with --save to keep it)")
+    mode.add_argument("-m", "--minimized", action="store_true",
+                      help="open the GUI minimized (to the tray when Minimize to tray is on)")
     mode.add_argument("-q", "--quiet", action="store_true", help="only print errors in --nogui")
 
     job = parser.add_argument_group("job (override the saved config)")
@@ -3281,6 +3614,10 @@ def main(argv=None):
         saved.pop("hotkey", None)
         if not write_config(config_path, saved):
             print(f"{parser.prog}: warning: cannot write {config_path}", file=sys.stderr)
+        try:
+            sync_autostart(resolve_options(fields), config_path)
+        except (OSError, BackendError) as exc:
+            print(f"{parser.prog}: warning: startup entry not updated ({exc})", file=sys.stderr)
 
     if args.record is not None:
         args.nogui = True
@@ -3295,7 +3632,10 @@ def main(argv=None):
             args.nogui = True
         else:
             overrides = {**stored, "backend": backend, "theme": theme, "hotkeys": hotkeys}
-            App(root, config_path, overrides, auto_listen=args.listen, auto_start=args.start)
+            App(
+                root, config_path, overrides, auto_listen=args.listen, auto_start=args.start,
+                start_minimized=args.minimized,
+            )
             root.mainloop()
             return 0
 
