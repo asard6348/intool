@@ -36,6 +36,7 @@ APP_DIRNAME = "Intool"
 VERSION = "1.0.0"
 VIRTUAL_NAME = "Intool Virtual Device"
 RESCAN_SECONDS = 3.0
+DRAIN_READS = 256
 SCROLL_NOTCH = 120
 CHORD_TIMEOUT = 1.5
 
@@ -987,6 +988,17 @@ class EvdevSource:
     def set_motion(self, enabled):
         self.motion = enabled
 
+    def _read(self, fd):
+        chunks = []
+        for _ in range(DRAIN_READS):
+            try:
+                chunks.append(os.read(fd, EVENT_SIZE * 64))
+            except BlockingIOError:
+                break
+            if not select.select([fd], [], [], 0)[0]:
+                break
+        return b"".join(chunks)
+
     def poll(self, timeout):
         if time.monotonic() >= self._next_scan:
             self._scan()
@@ -1000,23 +1012,33 @@ class EvdevSource:
                 self._drop(fd)
             self._next_scan = 0.0
             return []
-        events = []
-        moved = [0, 0]
+        raw = []
         for fd in ready:
             try:
-                data = os.read(fd, EVENT_SIZE * 64)
-            except BlockingIOError:
-                continue
+                data = self._read(fd)
             except OSError:
                 self._drop(fd)
                 continue
             for offset in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
-                _, _, etype, code, value = struct.unpack_from(EVENT_FMT, data, offset)
-                if etype == EV_KEY and value in (0, 1):
-                    events.append((code, value))
-                elif etype == EV_REL and self.motion and code in (REL_X, REL_Y):
-                    moved[code] += value
-        events += [(axis, moved[index]) for index, axis in enumerate((POINTER_DX, POINTER_DY)) if moved[index]]
+                sec, usec, etype, code, value = struct.unpack_from(EVENT_FMT, data, offset)
+                raw.append((sec, usec, etype, code, value))
+        raw.sort(key=lambda event: event[:2])
+        events = []
+        moved = [0, 0]
+
+        def flush_motion():
+            for index, axis in enumerate((POINTER_DX, POINTER_DY)):
+                if moved[index]:
+                    events.append((axis, moved[index]))
+                moved[index] = 0
+
+        for _, _, etype, code, value in raw:
+            if etype == EV_KEY and value in (0, 1):
+                flush_motion()
+                events.append((code, value))
+            elif etype == EV_REL and self.motion and code in (REL_X, REL_Y):
+                moved[code] += value
+        flush_motion()
         return events
 
     def close(self):
@@ -1409,6 +1431,8 @@ class Recorder:
         self.tracking = self.options.pointer != "off"
         self.absolute = pointer is not None and self.options.coordinates != "relative"
         self.wants_motion = self.tracking and pointer is None
+        if self.tracking and pointer is not None and not self.absolute:
+            self.location = tuple(pointer.position())
 
     def poll_timeout(self):
         return self.options.path_interval / 2 if self.options.pointer == "path" else 0.1
@@ -1478,10 +1502,18 @@ class Recorder:
         elif len(keys) >= 2 and steps[keys[-2]] == ("down", codes):
             del steps[keys[-2]:]
 
+    @staticmethod
+    def _is_key(step):
+        return step[0] in ("down", "up")
+
+    @staticmethod
+    def _pop_while(steps, test):
+        while steps and test(steps[-1]):
+            steps.pop()
+
     def _trimmed(self, by_click, chord):
         steps = list(self.steps)
-        while steps and (steps[-1][0] in TRAILING_STEPS or steps[-1][1][0] in chord):
-            steps.pop()
+        self._pop_while(steps, lambda step: step[0] in TRAILING_STEPS or step[1][0] in chord)
         if by_click and self.options.trim_click:
             self._drop_final_click(steps)
         if self.options.drop_held:
@@ -1489,8 +1521,21 @@ class Recorder:
                 indices = [i for i, step in enumerate(steps) if step == ("down", [code])]
                 if indices:
                     del steps[indices[-1]]
-        while steps and steps[-1][0] in TRAILING_STEPS:
-            steps.pop()
+        self._pop_while(steps, lambda step: step[0] in TRAILING_STEPS)
+        if self.options.pointer == "path" and not any(self._is_key(step) for step in steps):
+            return self._path_only()
+        return steps
+
+    def _path_only(self):
+        steps, waited = [], 0.0
+        for step in self.steps:
+            if step[0] == "wait":
+                waited += step[1]
+            elif not self._is_key(step):
+                if waited:
+                    steps.append(("wait", waited))
+                    waited = 0.0
+                steps.append(step)
         return steps
 
     def finish(self, by_click=False, chord=()):
@@ -1954,19 +1999,22 @@ class Engine:
             if self.recording or self.running:
                 return False
             options = self.record_options
+            pointer = None
             try:
-                pointer = None if options.pointer == "off" else open_pointer(self.pointer_command)
+                if options.pointer != "off":
+                    pointer = open_pointer(self.pointer_command)
+                    if pointer is None and options.coordinates == "absolute":
+                        raise BackendError(
+                            "Absolute pointer positions are not available here; "
+                            "use Pointer coordinates: auto or relative."
+                        )
+                recorder = Recorder(pointer, options=options)
             except BackendError as exc:
+                if pointer is not None:
+                    pointer.close()
                 self._emit("error", "Recording Error", str(exc))
                 return False
-            if pointer is None and options.pointer != "off" and options.coordinates == "absolute":
-                self._emit(
-                    "error", "Recording Error",
-                    "Absolute pointer positions are not available here; "
-                    "use Pointer coordinates: auto or relative.",
-                )
-                return False
-            self._recorder = Recorder(pointer, options=options)
+            self._recorder = recorder
             self.recording = True
         self._ensure_monitor()
         self._emit("state")
@@ -2109,6 +2157,12 @@ class App:
                 bg=self.bg_color, fg=self.fg_color, selectcolor=self.entry_bg,
                 activebackground=self.bg_color, activeforeground=self.fg_color,
             )
+        elif kind == "heading":
+            widget.configure(bg=self.bg_color, fg=self.status_listening)
+        elif kind == "muted":
+            widget.configure(bg=self.bg_color, fg=self.arrow_color)
+        elif kind == "separator":
+            widget.configure(bg=self.border_color)
 
     def _frame(self, parent, **kw):
         return self._themed_widget(tk.Frame(parent, **kw), "frame")
@@ -2129,7 +2183,7 @@ class App:
 
     def _settings_entry(self, parent, variable):
         entry = tk.Entry(
-            parent, textvariable=variable, width=14, justify=tk.CENTER, font=("Arial", 10),
+            parent, textvariable=variable, width=1, justify=tk.LEFT, font=("Arial", 10),
             relief=tk.FLAT, highlightthickness=1,
         )
         entry.bind("<FocusOut>", lambda _: self.commit_settings())
@@ -2160,7 +2214,7 @@ class App:
         return win
 
     def _combo(self, parent, values, current, handler):
-        combo = ttk.Combobox(parent, values=list(values), state="readonly", width=18)
+        combo = ttk.Combobox(parent, values=list(values), state="readonly", width=1)
         combo.set(current)
         combo.bind("<<ComboboxSelected>>", handler)
         self._combos.append(combo)
@@ -2333,68 +2387,101 @@ class App:
             width=60,
         )
 
+    def _section(self, parent, title, row):
+        heading = tk.Label(parent, text=title.upper(), anchor="w", font=("Arial", 8, "bold"))
+        self._themed_widget(heading, "heading")
+        heading.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(0 if row == 0 else 18, 4))
+        rule = tk.Frame(parent, height=1)
+        self._themed_widget(rule, "separator")
+        rule.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        return row + 2
+
+    def _setting(self, parent, row, title, widget, hint=""):
+        label = tk.Label(parent, text=title, anchor="w", font=("Arial", 9))
+        self._themed_widget(label, "label")
+        label.grid(row=row, column=0, sticky="w", padx=(0, 20), pady=5)
+        widget.grid(row=row, column=1, sticky="ew", pady=5, ipady=2)
+        row += 1
+        if hint:
+            note = tk.Label(parent, text=hint, anchor="w", font=("Arial", 8))
+            self._themed_widget(note, "muted")
+            note.grid(row=row, column=1, sticky="w", pady=(0, 4))
+            row += 1
+        return row
+
+    def _toggle(self, parent, row, text, variable, command):
+        check = tk.Checkbutton(
+            parent, text=text, variable=variable, anchor="w",
+            highlightthickness=0, bd=0, font=("Arial", 9), command=command,
+        )
+        self._themed_widget(check, "check")
+        check.grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
+        return row + 1
+
+    def _action_row(self, parent, row, actions):
+        bar = self._frame(parent)
+        bar.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        bar.columnconfigure(tuple(range(len(actions))), weight=1, uniform="action")
+        for column, (text, command) in enumerate(actions):
+            self._button(bar, text, command, font=("Arial", 9, "bold")).grid(
+                row=0, column=column, sticky="ew", padx=(0 if column == 0 else 8, 0), ipady=3,
+            )
+        return row + 1
+
+    def _settings_frame(self, win):
+        frame = self._frame(win, padx=26, pady=22)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(1, weight=1, minsize=220)
+        return frame
+
     def open_settings(self):
         win = self._window("Settings")
-        frame = self._frame(win, padx=20, pady=20)
-        frame.pack(fill=tk.BOTH, expand=True)
-        frame.columnconfigure(0, weight=1)
-        row = 0
+        frame = self._settings_frame(win)
 
-        def add_row(title, widget):
-            nonlocal row
-            self._label(frame, title, bold=True).grid(row=row, column=0, sticky="w", pady=(0, 4))
-            widget.grid(row=row + 1, column=0, sticky="ew", pady=(0, 12))
-            row += 2
+        row = self._section(frame, "Appearance", 0)
+        row = self._setting(
+            frame, row, "Theme",
+            self._combo(frame, ["Auto"] + list(THEMES), self.theme_selection, self.on_theme_change),
+        )
+        row = self._toggle(frame, row, "Remember window position", self.remember_pos_var, self.save_config)
 
-        add_row("Theme:", self._combo(frame, ["Auto"] + list(THEMES), self.theme_selection, self.on_theme_change))
-        add_row("Key state:", self._combo(frame, STATES, self.state_selection, self.on_state_change))
-        add_row("Scroll device:", self._combo(frame, DEVICES, self.device_selection, self.on_device_change))
-        add_row("Interval (press & release):", self._settings_entry(frame, self.interval_var))
-        add_row("Scroll value (120 = one notch):", self._settings_entry(frame, self.value_var))
+        row = self._section(frame, "Input", row)
+        row = self._setting(
+            frame, row, "Key state", self._combo(frame, STATES, self.state_selection, self.on_state_change),
+        )
+        row = self._setting(
+            frame, row, "Scroll device",
+            self._combo(frame, DEVICES, self.device_selection, self.on_device_change),
+        )
+        row = self._setting(
+            frame, row, "Interval", self._settings_entry(frame, self.interval_var), "hold time for press & release",
+        )
+        row = self._setting(
+            frame, row, "Scroll value", self._settings_entry(frame, self.value_var), "120 = one wheel notch",
+        )
         if IS_LINUX:
-            add_row("Input backend:", self._combo(frame, LinuxInput.MODES, self.backend_selection, self.on_backend_change))
+            row = self._setting(
+                frame, row, "Input backend",
+                self._combo(frame, LinuxInput.MODES, self.backend_selection, self.on_backend_change),
+            )
+        row = self._toggle(frame, row, "Act immediately on start", self.immediate_var, self.save_config)
+
+        row = self._section(frame, "Advanced", row)
         row = self._option_rows(frame, "input", row)
 
-        for text, variable, bottom in (
-            ("Act immediately on start", self.immediate_var, 4),
-            ("Remember window position", self.remember_pos_var, 14),
-        ):
-            check = tk.Checkbutton(
-                frame, text=text, variable=variable,
-                highlightthickness=0, bd=0, font=("Arial", 9), command=self.save_config,
-            )
-            self._themed_widget(check, "check")
-            check.grid(row=row, column=0, sticky="w", pady=(0, bottom))
-            row += 1
-
-        self._button(
-            frame, "Recording Settings", self.open_recording_settings, font=("Arial", 9, "bold"), width=18,
-        ).grid(row=row, column=0, sticky="ew", pady=(0, 8))
-        row += 1
-        self._button(
-            frame, "Open Config Dir", self.open_config_dir, font=("Arial", 9, "bold"), width=18,
-        ).grid(row=row, column=0, sticky="ew", pady=(0, 8))
-        row += 1
-        self._button(
-            frame, "Delete Config", self.delete_config, font=("Arial", 9, "bold"), width=18,
-        ).grid(row=row, column=0, sticky="ew")
+        row = self._section(frame, "Manage", row)
+        self._action_row(frame, row, (
+            ("Recording Settings", self.open_recording_settings),
+            ("Open Config Dir", self.open_config_dir),
+            ("Delete Config", self.delete_config),
+        ))
         self._set_minsize(win)
 
     def _option_rows(self, frame, group, row):
-        for option in OPTIONS:
-            if option.group != group:
-                continue
+        options = [option for option in OPTIONS if option.group == group]
+        for option in (o for o in options if o.kind != "bool"):
             variable = self.option_vars[option.key]
-            if option.kind == "bool":
-                check = tk.Checkbutton(
-                    frame, text=option.label, variable=variable,
-                    highlightthickness=0, bd=0, font=("Arial", 9), command=self.commit_settings,
-                )
-                self._themed_widget(check, "check")
-                check.grid(row=row, column=0, sticky="w", pady=(0, 6))
-                row += 1
-                continue
-            self._label(frame, option.label + ":", bold=True).grid(row=row, column=0, sticky="w", pady=(0, 4))
+            title, _, hint = option.label.partition(" (")
             if option.kind == "choice":
                 widget = self._combo(
                     frame, option.choices, variable.get(),
@@ -2402,15 +2489,14 @@ class App:
                 )
             else:
                 widget = self._settings_entry(frame, variable)
-            widget.grid(row=row + 1, column=0, sticky="ew", pady=(0, 12))
-            row += 2
+            row = self._setting(frame, row, title, widget, hint.rstrip(")"))
+        for option in (o for o in options if o.kind == "bool"):
+            row = self._toggle(frame, row, option.label, self.option_vars[option.key], self.commit_settings)
         return row
 
     def open_recording_settings(self):
         win = self._window("Recording Settings")
-        frame = self._frame(win, padx=20, pady=20)
-        frame.pack(fill=tk.BOTH, expand=True)
-        frame.columnconfigure(0, weight=1)
+        frame = self._settings_frame(win)
         self._option_rows(frame, "recording", 0)
         self._set_minsize(win)
 

@@ -64,7 +64,7 @@ Windows may show a SmartScreen warning for unsigned executables; choose **More i
 
 Run the executable without arguments. Fill in the delay, actions per trigger, repeat cycles, action, and hotkey, then press **Start**, or **Start Listening** to start and stop the job with the hotkey.
 
-**Start Recording** captures the keys, mouse buttons and pointer you use until you press **Stop Recording** (or the recording hotkey, **F10** by default, which also starts a recording while listening) and writes them into the Action field. To play a recording once, turn on **Act immediately on start** and set **Repeat cycles** to 1. Recording and listening share one input source and can run together; the job hotkey is ignored while recording. Recording is unavailable while a job runs, because injected input would be captured too.
+**Start Recording** captures the keys, mouse buttons and pointer you use until you press **Stop Recording** (or the recording hotkey, **F10** by default, which also starts a recording while listening) and writes them into the Action field. To play a recording once, turn on **Act immediately on start** and set **Repeat cycles** to 1. Recording and listening share one input source and can run together; the job hotkey is ignored while recording. Recording is unavailable while a job runs, because injected input would be captured too. With **Record pointer** set to `path`, a recording that holds only pointer movement is kept as a path of `pos:` or `move:` steps.
 
 ### Action sequences
 

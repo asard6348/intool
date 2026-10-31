@@ -841,8 +841,10 @@ class RecorderModeTests(unittest.TestCase):
         pointer.current = (15, 7)
         recorder.feed(self.A, 1)
         recorder.feed(self.A, 0)
-        self.assertEqual(recorder.finish(),
-                         "down:a, wait:100ms, up:a, wait:100ms, move:5:-3, down:a, wait:100ms, up:a")
+        self.assertEqual(
+            recorder.finish(),
+            "move:10:10, down:a, wait:100ms, up:a, wait:100ms, move:5:-3, down:a, wait:100ms, up:a",
+        )
 
     def test_motion_events_become_relative_moves_without_a_pointer(self):
         recorder = self.recorder([0.0, 0.1])
@@ -877,6 +879,32 @@ class RecorderModeTests(unittest.TestCase):
         text = recorder.finish()
         self.assertTrue(text.startswith("pos:0:0, wait:60ms, pos:5:5, wait:60ms, pos:9:9"))
         self.assertTrue(text.endswith("down:a, wait:100ms, up:a"))
+
+    def test_relative_path_without_keys_is_kept(self):
+        pointer = FakePointer()
+        recorder = self.recorder(
+            [0.0, 0.06, 0.12], pointer, pointer="path", coordinates="relative", path_interval=0.05,
+        )
+        pointer.current = (4, 2)
+        recorder.tick()
+        pointer.current = (9, 2)
+        recorder.tick()
+        self.assertEqual(recorder.finish(), "move:4:2, wait:60ms, move:5:0")
+
+    def test_path_with_only_the_stop_hotkey_keeps_the_path(self):
+        recorder = self.recorder([0.0, 0.06, 0.12], pointer="path", path_interval=0.05)
+        recorder.motion(intool.POINTER_DX, 3)
+        recorder.tick()
+        recorder.motion(intool.POINTER_DY, 2)
+        recorder.feed(self.A, 1)
+        self.assertEqual(recorder.finish(chord=(self.A,)), "move:3:0, wait:60ms, move:0:2")
+
+    def test_pointer_steps_without_keys_are_dropped_when_not_sampling_a_path(self):
+        pointer = FakePointer()
+        recorder = self.recorder([0.0, 0.1], pointer, coordinates="relative")
+        pointer.current = (6, 6)
+        recorder.feed(self.A, 1)
+        self.assertEqual(recorder.finish(chord=(self.A,)), "")
 
     def test_path_samples_respect_the_interval(self):
         pointer = FakePointer()
@@ -1129,6 +1157,7 @@ class CommandPointerTests(unittest.TestCase):
         self.assertFalse(engine.recording)
 
 
+@unittest.skipUnless(intool.IS_LINUX, "evdev is Linux only")
 class EvdevMotionTests(unittest.TestCase):
     def source(self):
         read, write = os.pipe()
@@ -1157,6 +1186,37 @@ class EvdevMotionTests(unittest.TestCase):
             (intool.EV_REL, intool.REL_Y, 7), (intool.EV_REL, intool.REL_WHEEL, 1),
         ))
         self.assertEqual(source.poll(0.1), [(intool.POINTER_DX, 3), (intool.POINTER_DY, 7)])
+
+    @staticmethod
+    def stamped(*events):
+        return b"".join(struct.pack(intool.EVENT_FMT, sec, usec, t, c, v) for sec, usec, t, c, v in events)
+
+    def test_motion_stays_ordered_around_keys(self):
+        source, write = self.source()
+        source.set_motion(True)
+        os.write(write, self.packet(
+            (intool.EV_REL, intool.REL_X, 5), (intool.EV_KEY, intool.BTN_LEFT, 1),
+            (intool.EV_REL, intool.REL_X, 2), (intool.EV_KEY, intool.BTN_LEFT, 0),
+        ))
+        self.assertEqual(source.poll(0.1), [
+            (intool.POINTER_DX, 5), (intool.BTN_LEFT, 1), (intool.POINTER_DX, 2), (intool.BTN_LEFT, 0),
+        ])
+
+    def test_events_are_merged_by_timestamp(self):
+        source, write = self.source()
+        source.set_motion(True)
+        os.write(write, self.stamped(
+            (1, 500, intool.EV_KEY, intool.BTN_LEFT, 1),
+            (1, 100, intool.EV_REL, intool.REL_Y, 3),
+        ))
+        self.assertEqual(source.poll(0.1), [(intool.POINTER_DY, 3), (intool.BTN_LEFT, 1)])
+
+    def test_a_backlog_is_drained_in_one_poll(self):
+        source, write = self.source()
+        source.set_motion(True)
+        burst = [(intool.EV_REL, intool.REL_X, 1)] * 500 + [(intool.EV_KEY, intool.KEYS["f10"], 1)]
+        os.write(write, self.packet(*burst))
+        self.assertEqual(source.poll(0.1), [(intool.POINTER_DX, 500), (intool.KEYS["f10"], 1)])
 
     def test_zero_net_motion_is_not_reported(self):
         source, write = self.source()
