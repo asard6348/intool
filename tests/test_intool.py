@@ -134,15 +134,14 @@ class ParsingTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(intool.parse_sequence(text))
 
-    def test_parse_hotkeys(self):
-        chords = intool.parse_hotkeys("ctrl+k, ctrl+c")
-        self.assertEqual([target for _, target in chords], [intool.KEYS["k"], intool.KEYS["c"]])
-        self.assertEqual(len(intool.parse_hotkeys("f8")), 1)
+    def test_parse_hotkey_joins_keys_with_plus(self):
+        chord = intool.parse_hotkey("ctrl+k+c")
+        self.assertEqual(len(chord), 3)
+        self.assertEqual(chord[-1], {intool.KEYS["c"]})
+        self.assertEqual(len(intool.parse_hotkey("f8")), 1)
 
-    def test_parse_hotkeys_rejects_bad_input(self):
-        for text in ("", "f8, bogus", "bogus+f6", None):
-            with self.subTest(text=text):
-                self.assertIsNone(intool.parse_hotkeys(text))
+    def test_commas_are_no_longer_a_hotkey_sequence(self):
+        self.assertIsNone(intool.parse_hotkey("ctrl+k, ctrl+c"))
 
     def test_to_bool(self):
         self.assertTrue(intool.to_bool(True))
@@ -151,15 +150,30 @@ class ParsingTests(unittest.TestCase):
         self.assertFalse(intool.to_bool(None))
 
     def test_parse_hotkey(self):
-        mods, target = intool.parse_hotkey("ctrl+f6")
-        self.assertEqual(target, intool.KEYS["f6"])
-        self.assertEqual(len(mods), 1)
-        self.assertIn(intool.KEYS["leftctrl"], intool.MODS["ctrl"])
+        chord = intool.parse_hotkey("ctrl+f6")
+        self.assertEqual(chord[-1], {intool.KEYS["f6"]})
+        self.assertEqual(len(chord), 2)
+        self.assertIn(intool.KEYS["leftctrl"], chord[0])
 
     def test_parse_hotkey_rejects_bad_input(self):
-        self.assertIsNone(intool.parse_hotkey("bogus"))
-        self.assertIsNone(intool.parse_hotkey("bogus+f6"))
-        self.assertIsNone(intool.parse_hotkey(""))
+        for text in ("bogus", "bogus+f6", "", None):
+            with self.subTest(text=text):
+                self.assertIsNone(intool.parse_hotkey(text))
+
+    def test_bindings_pair_a_hotkey_with_an_action(self):
+        hotkey, steps = intool.parse_binding("ctrl+f7 = space, wait:1s, a")
+        self.assertEqual(hotkey[-1], {intool.KEYS["f7"]})
+        self.assertEqual([kind for kind, _ in steps], ["press", "wait", "press"])
+        for text in ("f7", "bogus = a", "f7 = nope", "f7 = a, pos:1", " = a"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                intool.parse_binding(text)
+
+    def test_binding_lists_are_read_line_by_line(self):
+        self.assertEqual(intool.parse_bindings("f7 = a\n\n  f6 = b  \n"), ["f7 = a", "f6 = b"])
+        with self.assertRaises(ValueError):
+            intool.parse_bindings("f7 = a\nbad")
+        self.assertEqual(intool.valid_bindings(["f7 = a", "bad", 5]), ["f7 = a"])
+        self.assertEqual(intool.valid_bindings("f7 = a"), [])
 
     def test_aliases(self):
         self.assertEqual(intool.match_choice("both", intool.STATES), "press & release")
@@ -332,9 +346,9 @@ class JobTests(unittest.TestCase):
         self.assertEqual([item["kind"] for item in job.specs()], ["pos", "press", "wait"])
         self.assertTrue(all(item["state"] == job.state for item in job.specs()))
 
-    def test_hotkey_sequence_is_parsed(self):
-        job = intool.job_from_fields(fields(hotkey="ctrl+k, ctrl+c"))
-        self.assertEqual(len(job.hotkey), 2)
+    def test_hotkey_chord_is_parsed(self):
+        job = intool.job_from_fields(fields(hotkey="ctrl+k+c"))
+        self.assertEqual(len(job.hotkey), 3)
 
     def test_immediate_defaults_off_and_follows_the_field(self):
         self.assertFalse(intool.job_from_fields(fields()).immediate)
@@ -359,26 +373,17 @@ class JobTests(unittest.TestCase):
 
 
 class HotkeyResolutionTests(unittest.TestCase):
-    def test_defaults_when_nothing_stored(self):
-        self.assertEqual(intool.resolve_hotkeys({}, "press"), intool.DEFAULT_HOTKEYS)
+    def test_default_when_nothing_stored(self):
+        self.assertEqual(intool.resolve_hotkey({}, "press"), intool.DEFAULT_HOTKEY)
+        self.assertIsNotNone(intool.parse_hotkey(intool.DEFAULT_HOTKEY))
 
-    def test_stored_hotkeys_override_defaults(self):
-        hotkeys = intool.resolve_hotkeys({"hotkeys": {"press": "f1"}}, "press")
-        self.assertEqual(hotkeys["press"], "f1")
-        self.assertEqual(hotkeys["release"], intool.DEFAULT_HOTKEYS["release"])
+    def test_a_stored_hotkey_wins(self):
+        self.assertEqual(intool.resolve_hotkey({"hotkey": "f2", "hotkeys": {"press": "f1"}}, "press"), "f2")
 
-    def test_legacy_single_hotkey_migrates_to_active_state(self):
-        hotkeys = intool.resolve_hotkeys({"hotkey": "f2"}, "release")
-        self.assertEqual(hotkeys["release"], "f2")
-
-    def test_default_hotkeys_are_distinct_and_valid(self):
-        values = list(intool.DEFAULT_HOTKEYS.values())
-        self.assertEqual(len(values), len(set(values)))
-        for value in values:
-            self.assertIsNotNone(intool.parse_hotkey(value))
-
-    def test_default_state_uses_f8(self):
-        self.assertEqual(intool.DEFAULT_HOTKEYS["press & release"], "f8")
+    def test_legacy_per_state_hotkeys_migrate_to_the_selected_state(self):
+        data = {"hotkeys": {"press": "f1", "release": "f3"}}
+        self.assertEqual(intool.resolve_hotkey(data, "release"), "f3")
+        self.assertEqual(intool.resolve_hotkey(data, "press & release"), intool.DEFAULT_HOTKEY)
 
 
 class ConfigTests(unittest.TestCase):
@@ -421,52 +426,68 @@ class CommandLineTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.parser.parse_args(["-v", "0"])
 
-    def test_per_state_hotkey_options(self):
-        args = self.parser.parse_args(["--hotkey-press", "f1", "--hotkey-release", "f2",
-                                       "--hotkey-press-release", "f3"])
-        self.assertEqual((args.hotkey_press, args.hotkey_release, args.hotkey_press_release),
-                         ("f1", "f2", "f3"))
+    def test_bind_option_is_repeatable_and_validated(self):
+        args = self.parser.parse_args(["-B", "f7=space", "--bind", " f6 = a, wait:1s, b "])
+        self.assertEqual(args.bind, ["f7=space", "f6 = a, wait:1s, b"])
+        self.assertIsNone(self.parser.parse_args([]).bind)
+        for text in ("f7", "bogus=a", "f7=nope"):
+            with self.subTest(text=text), self.assertRaises(SystemExit):
+                self.parser.parse_args(["-B", text])
+
+    def test_per_state_hotkey_options_are_gone(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(["--hotkey-press", "f1"])
 
     def test_collect_options_applies_cli_over_config(self):
-        args = self.parser.parse_args(["-S", "press", "-k", "f9", "-i", "50ms"])
-        data = {"hotkeys": {"press & release": "f8"}, "state": "press & release"}
-        fields_, hotkeys, backend, theme = intool.collect_options(args, data)
+        args = self.parser.parse_args(["-S", "press", "-k", "f9", "-i", "50ms", "-B", "f7=space"])
+        data = {"hotkey": "f8", "state": "press & release", "bindings": ["f6 = a"]}
+        fields_, backend, theme = intool.collect_options(args, data)
         self.assertEqual(fields_["state"], "press")
         self.assertEqual(fields_["hotkey"], "f9")
-        self.assertEqual(hotkeys["press"], "f9")
-        self.assertEqual(hotkeys["press & release"], "f8")
+        self.assertEqual(fields_["bindings"], ["f7=space"])
         self.assertEqual(fields_["interval"], "50ms")
         self.assertEqual(backend, "Auto")
         self.assertEqual(theme, "Auto")
 
     def test_collect_options_uses_config_when_no_cli(self):
         args = self.parser.parse_args([])
-        data = {"state": "release", "device": "touchpad", "value": "30"}
-        fields_, hotkeys, _, _ = intool.collect_options(args, data)
+        data = {"state": "release", "device": "touchpad", "value": "30", "hotkey": "f4",
+                "bindings": ["f6 = a", "junk"]}
+        fields_, _, _ = intool.collect_options(args, data)
         self.assertEqual(fields_["state"], "release")
         self.assertEqual(fields_["device"], "touchpad")
         self.assertEqual(fields_["value"], "30")
-        self.assertEqual(fields_["hotkey"], hotkeys["release"])
+        self.assertEqual(fields_["hotkey"], "f4")
+        self.assertEqual(fields_["bindings"], ["f6 = a"])
 
-    def test_immediate_flag(self):
+    def test_collect_options_defaults(self):
+        fields_, _, _ = intool.collect_options(self.parser.parse_args([]), {})
+        self.assertEqual(fields_["hotkey"], intool.DEFAULT_HOTKEY)
+        self.assertEqual(fields_["bindings"], [])
+        self.assertEqual((fields_["h"], fields_["m"], fields_["s"], fields_["ms"]), ("0", "0", "1", "0"))
+
+    def test_immediate_flag_can_be_turned_on_and_off(self):
         self.assertTrue(self.parser.parse_args(["-I"]).immediate)
-        self.assertFalse(self.parser.parse_args([]).immediate)
+        self.assertFalse(self.parser.parse_args(["--no-immediate"]).immediate)
+        self.assertIsNone(self.parser.parse_args([]).immediate)
 
     def test_collect_options_carries_immediate_from_cli_or_config(self):
-        cli, *_ = intool.collect_options(self.parser.parse_args(["--immediate"]), {})
+        cli, *_ = intool.collect_options(self.parser.parse_args(["--immediate"]), {"immediate": False})
         self.assertTrue(cli["immediate"])
-        stored, *_ = intool.collect_options(self.parser.parse_args([]), {"immediate": True})
-        self.assertTrue(stored["immediate"])
+        off, *_ = intool.collect_options(self.parser.parse_args(["--no-immediate"]), {})
+        self.assertFalse(off["immediate"])
+        stored, *_ = intool.collect_options(self.parser.parse_args([]), {"immediate": False})
+        self.assertFalse(stored["immediate"])
         default, *_ = intool.collect_options(self.parser.parse_args([]), {})
-        self.assertFalse(default["immediate"])
+        self.assertTrue(default["immediate"])
 
     def test_action_and_hotkey_accept_sequences(self):
-        args = self.parser.parse_args(["-a", "pos:1:2, mouse0", "-k", "ctrl+k, ctrl+c"])
+        args = self.parser.parse_args(["-a", "pos:1:2, mouse0", "-k", "ctrl+k+c"])
         self.assertEqual(args.action, "pos:1:2, mouse0")
-        self.assertEqual(args.hotkey, "ctrl+k, ctrl+c")
+        self.assertEqual(args.hotkey, "ctrl+k+c")
 
     def test_invalid_sequences_are_rejected(self):
-        for argv in (["-a", "mouse0, nope"], ["-a", "pos:1"], ["-k", "f8, nope"]):
+        for argv in (["-a", "mouse0, nope"], ["-a", "pos:1"], ["-k", "f8, f9"]):
             with self.subTest(argv=argv), self.assertRaises(SystemExit):
                 self.parser.parse_args(argv)
 
@@ -571,45 +592,27 @@ class CommandLineTests(unittest.TestCase):
 
 class HotkeyMatcherTests(unittest.TestCase):
     CTRL = intool.KEYS["leftctrl"]
-    K, C, X = intool.KEYS["k"], intool.KEYS["c"], intool.KEYS["x"]
+    K, C = intool.KEYS["k"], intool.KEYS["c"]
 
-    def matcher(self, text):
-        return intool.HotkeyMatcher(intool.parse_hotkeys(text))
+    def matcher(self, text, **kwargs):
+        return intool.HotkeyMatcher(intool.parse_hotkey(text), **kwargs)
 
-    def test_single_chord_fires_every_time(self):
+    def test_single_key_fires_every_time(self):
         matcher = self.matcher("f8")
         f8 = intool.KEYS["f8"]
-        self.assertTrue(matcher.feed(f8, {f8}, 0.0))
-        self.assertTrue(matcher.feed(f8, {f8}, 0.1))
+        self.assertTrue(matcher.feed(f8, {f8}))
+        self.assertTrue(matcher.feed(f8, {f8}))
 
     def test_chord_needs_its_modifiers(self):
         matcher = self.matcher("ctrl+k")
-        self.assertFalse(matcher.feed(self.K, {self.K}, 0.0))
-        self.assertTrue(matcher.feed(self.K, {self.CTRL, self.K}, 0.1))
+        self.assertFalse(matcher.feed(self.K, {self.K}))
+        self.assertTrue(matcher.feed(self.K, {self.CTRL, self.K}))
 
-    def test_sequence_fires_after_the_last_chord(self):
-        matcher = self.matcher("ctrl+k, ctrl+c")
-        self.assertFalse(matcher.feed(self.CTRL, {self.CTRL}, 0.0))
-        self.assertFalse(matcher.feed(self.K, {self.CTRL, self.K}, 0.1))
-        self.assertTrue(matcher.feed(self.C, {self.CTRL, self.C}, 0.5))
-        self.assertFalse(matcher.feed(self.C, {self.CTRL, self.C}, 0.6))
-
-    def test_sequence_resets_after_the_timeout(self):
-        matcher = self.matcher("ctrl+k, ctrl+c")
-        matcher.feed(self.K, {self.CTRL, self.K}, 0.0)
-        self.assertFalse(matcher.feed(self.C, {self.CTRL, self.C}, intool.CHORD_TIMEOUT + 0.1))
-
-    def test_unrelated_key_resets_the_sequence(self):
-        matcher = self.matcher("ctrl+k, ctrl+c")
-        matcher.feed(self.K, {self.CTRL, self.K}, 0.0)
-        matcher.feed(self.X, {self.CTRL, self.X}, 0.1)
-        self.assertFalse(matcher.feed(self.C, {self.CTRL, self.C}, 0.2))
-
-    def test_repeating_the_first_chord_restarts_the_sequence(self):
-        matcher = self.matcher("ctrl+k, ctrl+c")
-        matcher.feed(self.K, {self.CTRL, self.K}, 0.0)
-        matcher.feed(self.K, {self.CTRL, self.K}, 0.1)
-        self.assertTrue(matcher.feed(self.C, {self.CTRL, self.C}, 0.2))
+    def test_keys_joined_with_plus_fire_when_the_last_one_arrives(self):
+        matcher = self.matcher("ctrl+k+c")
+        self.assertFalse(matcher.feed(self.K, {self.CTRL, self.K}))
+        self.assertTrue(matcher.feed(self.C, {self.CTRL, self.K, self.C}))
+        self.assertFalse(matcher.feed(self.C, {self.K, self.C}))
 
 
 class FakePointer:
@@ -770,6 +773,28 @@ class UInputPointerTests(unittest.TestCase):
             [(intool.EV_ABS, intool.ABS_X, 0), (intool.EV_ABS, intool.ABS_Y, 49), (intool.EV_SYN, 0, 0)],
         ])
 
+    def test_repeating_a_position_is_nudged_so_the_kernel_does_not_drop_it(self):
+        pointer = self.pointer((100, 50))
+        pointer.move_to(40, 20)
+        pointer.move_to(40, 20)
+        self.assertEqual(pointer.sent[1:], [
+            [(intool.EV_ABS, intool.ABS_X, 41), (intool.EV_SYN, 0, 0)],
+            [(intool.EV_ABS, intool.ABS_X, 40), (intool.EV_ABS, intool.ABS_Y, 20), (intool.EV_SYN, 0, 0)],
+        ])
+
+    def test_the_nudge_stays_on_the_screen_at_the_right_edge(self):
+        pointer = self.pointer((100, 50))
+        pointer.move_to(99, 5)
+        pointer.move_to(99, 5)
+        self.assertEqual(pointer.sent[1][0][:3], (intool.EV_ABS, intool.ABS_X, 98))
+
+    def test_the_first_move_to_the_origin_is_nudged_because_the_device_starts_there(self):
+        pointer = self.pointer((100, 50))
+        pointer.move_to(0, 0)
+        self.assertEqual(len(pointer.sent), 2)
+        pointer.move_to(0, 10)
+        self.assertEqual(len(pointer.sent), 3)
+
     @unittest.skipUnless(intool.IS_LINUX, "uinput is Linux only")
     def test_create_declares_both_axes_with_the_screen_extent(self):
         pointer = self.pointer((1920, 1080))
@@ -787,7 +812,7 @@ class OptionTests(unittest.TestCase):
         options = intool.resolve_options({})
         self.assertIsNone(options["screen"])
         self.assertAlmostEqual(options["record_min_wait"], 0.01)
-        self.assertEqual(options["record_hotkey"], intool.parse_hotkeys("f10"))
+        self.assertEqual(options["record_hotkey"], intool.parse_hotkey("f10"))
         self.assertTrue(options["record_waits"])
         self.assertEqual(options["hotkey_order"], "modifiers first")
 
@@ -847,6 +872,48 @@ class OptionTests(unittest.TestCase):
         self.assertFalse(options["autostart"])
         self.assertIsNone(options["schedule_start"])
         self.assertEqual(options["autostart_arguments"], [])
+
+
+class MouseReleaseTests(unittest.TestCase):
+    def test_a_mouse_button_is_held_long_enough_to_register(self):
+        injector = RecordingInjector()
+        sleeps = []
+        with mock.patch.object(intool.time, "sleep", sleeps.append):
+            injector.pulse(spec("up", [intool.BTN_LEFT]))
+            injector.pulse(spec("down", [intool.BTN_LEFT]))
+            injector.pulse(spec("up", [intool.BTN_LEFT]))
+        self.assertEqual([step for step in injector.steps if step[0] == "key"],
+                         [("key", intool.BTN_LEFT, False), ("key", intool.BTN_LEFT, True),
+                          ("key", intool.BTN_LEFT, False)])
+        self.assertEqual(len(sleeps), 1)
+        self.assertTrue(0 < sleeps[0] <= intool.MIN_CLICK)
+
+    def test_a_slow_click_is_not_delayed_and_keys_are_never_delayed(self):
+        injector = RecordingInjector()
+        sleeps = []
+        with mock.patch.object(intool.time, "sleep", sleeps.append):
+            injector.pulse(spec("down", [intool.BTN_LEFT]))
+            injector.pressed_at[intool.BTN_LEFT] -= 1
+            injector.pulse(spec("up", [intool.BTN_LEFT]))
+            injector.pulse(spec("down", [intool.KEYS["a"]]))
+            injector.pulse(spec("up", [intool.KEYS["a"]]))
+        self.assertEqual(sleeps, [])
+
+    def test_release_all_lets_go_of_buttons_after_the_minimum_hold(self):
+        injector = RecordingInjector()
+        sleeps = []
+        with mock.patch.object(intool.time, "sleep", sleeps.append):
+            injector.pulse(spec("down", [intool.BTN_LEFT]))
+            injector.release_all()
+        self.assertEqual(injector.steps[-2:], [("key", intool.BTN_LEFT, False), ("flush",)])
+        self.assertEqual(injector.held, [])
+        self.assertEqual(len(sleeps), 1)
+
+    def test_countdown_formatting(self):
+        self.assertEqual(intool.format_countdown(0.04), "0.0s")
+        self.assertEqual(intool.format_countdown(12.34), "12.3s")
+        self.assertEqual(intool.format_countdown(75), "1:15")
+        self.assertEqual(intool.format_countdown(3725), "1:02:05")
 
 
 class MotionPointerTests(unittest.TestCase):
@@ -1265,24 +1332,22 @@ class HotkeyOrderTests(unittest.TestCase):
     CTRL, K = intool.KEYS["leftctrl"], intool.KEYS["k"]
 
     def test_modifiers_first_ignores_a_late_modifier(self):
-        matcher = intool.HotkeyMatcher(intool.parse_hotkeys("ctrl+k"))
-        self.assertFalse(matcher.feed(self.K, {self.K}, 0.0))
-        self.assertFalse(matcher.feed(self.CTRL, {self.K, self.CTRL}, 0.1))
+        matcher = intool.HotkeyMatcher(intool.parse_hotkey("ctrl+k"))
+        self.assertFalse(matcher.feed(self.K, {self.K}))
+        self.assertFalse(matcher.feed(self.CTRL, {self.K, self.CTRL}))
 
     def test_any_order_fires_when_the_modifier_arrives_last(self):
-        matcher = intool.HotkeyMatcher(intool.parse_hotkeys("ctrl+k"), any_order=True)
-        self.assertFalse(matcher.feed(self.K, {self.K}, 0.0))
-        self.assertTrue(matcher.feed(self.CTRL, {self.K, self.CTRL}, 0.1))
+        matcher = intool.HotkeyMatcher(intool.parse_hotkey("ctrl+k"), any_order=True)
+        self.assertFalse(matcher.feed(self.K, {self.K}))
+        self.assertTrue(matcher.feed(self.CTRL, {self.K, self.CTRL}))
 
     def test_any_order_still_fires_the_normal_way(self):
-        matcher = intool.HotkeyMatcher(intool.parse_hotkeys("ctrl+k"), any_order=True)
-        self.assertTrue(matcher.feed(self.K, {self.CTRL, self.K}, 0.0))
+        matcher = intool.HotkeyMatcher(intool.parse_hotkey("ctrl+k"), any_order=True)
+        self.assertTrue(matcher.feed(self.K, {self.CTRL, self.K}))
 
     def test_codes_lists_every_chord_key(self):
-        matcher = intool.HotkeyMatcher(intool.parse_hotkeys("ctrl+k, f8"))
-        self.assertIn(self.K, matcher.codes())
-        self.assertIn(intool.KEYS["f8"], matcher.codes())
-        self.assertIn(self.CTRL, matcher.codes())
+        matcher = intool.HotkeyMatcher(intool.parse_hotkey("ctrl+k+f8"))
+        self.assertTrue({self.K, intool.KEYS["f8"], self.CTRL} <= matcher.codes())
 
 
 class WaylandScreenTests(unittest.TestCase):
@@ -1575,6 +1640,11 @@ class ScreenSizeTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(intool, "probe_screen", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     class FakeEngine(intool.Engine):
         def __init__(self):
             super().__init__(lambda *args: None, "Auto")
@@ -1711,7 +1781,7 @@ class EngineTests(unittest.TestCase):
 
         engine._open_source = open_source
         with mock.patch.object(intool, "open_pointer", return_value=None):
-            self.assertTrue(engine.start_listener(intool.parse_hotkeys("f8")))
+            self.assertTrue(engine.start_listener([intool.parse_hotkey("f8")]))
             self.assertTrue(engine.start_recording())
             self._wait_until(lambda: opened)
             engine.stop_recording()
@@ -1786,9 +1856,8 @@ class EngineTests(unittest.TestCase):
         step = spec("press", [30])
         self.assertIs(engine._resolve_move(step), step)
 
-    def test_estimated_pointer_warps_to_the_screen_center_first(self):
+    def test_auto_estimates_an_unreadable_pointer_from_the_screen_center(self):
         engine = self.FakeEngine()
-        engine.configure({"record_estimate": True, "screen": "800x600"})
         engine._screen = (800, 600)
         warped = []
         engine._execute = warped.append
@@ -1802,7 +1871,6 @@ class EngineTests(unittest.TestCase):
 
     def test_a_readable_pointer_is_preferred_over_the_estimate(self):
         engine = self.FakeEngine()
-        engine.configure({"record_estimate": True})
         engine._open_source = lambda: self.FakeSource([])
         engine._execute = lambda spec: self.fail("must not warp")
         with mock.patch.object(intool, "open_pointer", return_value=FakePointer()):
@@ -1810,44 +1878,65 @@ class EngineTests(unittest.TestCase):
             self.assertNotIsInstance(engine._recorder.pointer, intool.MotionPointer)
             engine.stop_recording()
 
-    def test_estimate_is_skipped_for_relative_coordinates_and_when_disabled(self):
-        for values in ({"record_estimate": True, "record_coordinates": "relative"}, {}):
-            with self.subTest(values=values):
+    def test_relative_coordinates_never_estimate_or_warp(self):
+        engine = self.FakeEngine()
+        engine.configure({"record_coordinates": "relative"})
+        engine._screen = (800, 600)
+        engine._open_source = lambda: self.FakeSource([])
+        engine._execute = lambda spec: self.fail("must not warp")
+        with mock.patch.object(intool, "open_pointer", return_value=None):
+            self.assertTrue(engine.start_recording())
+            self.assertIsNone(engine._recorder.pointer)
+            engine.stop_recording()
+
+    def test_auto_falls_back_to_relative_moves_when_the_estimate_is_impossible(self):
+        for reason in ("no screen size", "warp fails"):
+            with self.subTest(reason=reason):
                 engine = self.FakeEngine()
-                engine.configure(values)
+                events = []
+                engine.notify = lambda event, *args: events.append(event)
                 engine._open_source = lambda: self.FakeSource([])
-                engine._execute = lambda spec: self.fail("must not warp")
+                if reason == "warp fails":
+                    engine._screen = (800, 600)
+
+                    def fail(spec):
+                        raise OSError("uinput closed")
+
+                    engine._execute = fail
                 with mock.patch.object(intool, "open_pointer", return_value=None):
                     self.assertTrue(engine.start_recording())
                     self.assertIsNone(engine._recorder.pointer)
                     engine.stop_recording()
+                self.assertNotIn("error", events)
 
-    def test_estimate_without_a_screen_size_is_a_recording_error(self):
-        engine = self.FakeEngine()
-        engine.configure({"record_estimate": True})
-        events = []
-        engine.notify = lambda event, *args: events.append((event, args))
-        with mock.patch.object(intool, "open_pointer", return_value=None), \
-                mock.patch.object(intool, "probe_screen", return_value=None):
-            self.assertFalse(engine.start_recording())
-        self.assertFalse(engine.recording)
-        self.assertEqual(events[0][0], "error")
-        self.assertIn("screen size", events[0][1][1])
+    def test_absolute_coordinates_report_why_the_estimate_failed(self):
+        for reason in ("no screen size", "warp fails"):
+            with self.subTest(reason=reason):
+                engine = self.FakeEngine()
+                engine.configure({"record_coordinates": "absolute"})
+                events = []
+                engine.notify = lambda event, *args: events.append(event)
+                if reason == "warp fails":
+                    engine._screen = (800, 600)
 
-    def test_a_failing_warp_is_a_recording_error(self):
+                    def fail(spec):
+                        raise OSError("uinput closed")
+
+                    engine._execute = fail
+                with mock.patch.object(intool, "open_pointer", return_value=None):
+                    self.assertFalse(engine.start_recording())
+                self.assertEqual(events, ["error"])
+                self.assertFalse(engine.recording)
+
+    def test_the_estimate_never_starts_the_root_helper_unless_required(self):
         engine = self.FakeEngine()
-        engine.configure({"record_estimate": True})
+        engine.linux = mock.MagicMock()
         engine._screen = (800, 600)
-        events = []
-        engine.notify = lambda event, *args: events.append(event)
-
-        def fail(spec):
-            raise OSError("uinput closed")
-
-        engine._execute = fail
-        with mock.patch.object(intool, "open_pointer", return_value=None):
-            self.assertFalse(engine.start_recording())
-        self.assertEqual(events, ["error"])
+        engine._estimate_pointer(False)
+        engine.linux.injector.assert_called_once_with(helper=False)
+        engine.linux.reset_mock()
+        engine._estimate_pointer(True)
+        engine.linux.injector.assert_called_once_with(helper=True)
 
     def test_wlroots_cursor_reader_is_tried_after_the_other_compositors(self):
         names = [argv[0] for argv in intool.WAYLAND_POINTER_COMMANDS]
@@ -1861,7 +1950,7 @@ class EngineTests(unittest.TestCase):
         source = self.FakeSource([[(f10, 1)], [(f10, 0)], [(a, 1)], [(a, 0)], [(f10, 1)]])
         engine._open_source = lambda: source
         with mock.patch.object(intool, "open_pointer", return_value=None):
-            engine.start_listener(intool.parse_hotkeys("f8"))
+            engine.start_listener([intool.parse_hotkey("f8")])
             self._wait_until(lambda: any(event == "recorded" for event, _ in events))
         text = next(args[0] for event, args in events if event == "recorded")
         steps = [step for step in intool.parse_sequence(text) if step[0] != "wait"]
@@ -1873,13 +1962,13 @@ class EngineTests(unittest.TestCase):
     def test_job_hotkey_is_ignored_while_recording(self):
         engine = self.FakeEngine()
         fired = []
-        engine.on_hotkey = lambda: fired.append(True)
+        engine.on_hotkey = lambda index: fired.append(index)
         f8 = intool.KEYS["f8"]
         source = self.FakeSource([[(f8, 1)], [(f8, 0)]])
         engine._open_source = lambda: source
         with mock.patch.object(intool, "open_pointer", return_value=None):
             engine.start_recording()
-            engine.start_listener(intool.parse_hotkeys("f8"))
+            engine.start_listener([intool.parse_hotkey("f8")])
             self._wait_until(lambda: not source.batches)
             time.sleep(0.05)
             engine.stop_recording()
@@ -1889,13 +1978,58 @@ class EngineTests(unittest.TestCase):
     def test_job_hotkey_fires_when_not_recording(self):
         engine = self.FakeEngine()
         fired = []
-        engine.on_hotkey = lambda: fired.append(True)
+        engine.on_hotkey = lambda index: fired.append(index)
         f8 = intool.KEYS["f8"]
         source = self.FakeSource([[(f8, 1)]])
         engine._open_source = lambda: source
-        engine.start_listener(intool.parse_hotkeys("f8"))
+        engine.start_listener([intool.parse_hotkey("f8")])
         self._wait_until(lambda: fired)
+        self.assertEqual(fired, [0])
         engine.stop_listener()
+
+    def test_each_hotkey_fires_its_own_binding_index(self):
+        engine = self.FakeEngine()
+        fired = []
+        engine.on_hotkey = lambda index: fired.append(index)
+        f7, f9 = intool.KEYS["f7"], intool.KEYS["f9"]
+        source = self.FakeSource([[(f9, 1)], [(f9, 0)], [(f7, 1)]])
+        engine._open_source = lambda: source
+        engine.start_listener([intool.parse_hotkey("f7"), intool.parse_hotkey("f8"), intool.parse_hotkey("f9")])
+        self._wait_until(lambda: len(fired) == 2)
+        self.assertEqual(fired, [2, 0])
+        engine.stop_listener()
+
+    def test_toggle_binding_starts_switches_and_stops_jobs(self):
+        engine = self.FakeEngine()
+        first = intool.job_from_fields(fields(action="a", s="30"), need_hotkey=False)
+        second = intool.job_from_fields(fields(action="b", s="30"), need_hotkey=False)
+        engine.jobs = [first, second]
+        engine.toggle_binding(0)
+        self.assertTrue(engine.running)
+        self.assertIs(engine.job, first)
+        engine.toggle_binding(1)
+        self.assertTrue(engine.running)
+        self.assertIs(engine.job, second)
+        engine.toggle_binding(1)
+        self.assertFalse(engine.running)
+        engine.toggle_binding(7)
+        self.assertFalse(engine.running)
+
+    def test_remaining_counts_down_to_the_next_trigger(self):
+        engine = self.FakeEngine()
+        self.assertIsNone(engine.remaining())
+        engine.start(intool.job_from_fields(fields(s="30"), need_hotkey=False))
+        self._wait_until(lambda: engine.remaining() is not None)
+        self.assertTrue(28 < engine.remaining() <= 30)
+        engine.stop()
+        self.assertIsNone(engine.remaining())
+
+    def test_remaining_is_empty_while_the_action_runs(self):
+        engine = self.FakeEngine()
+        engine.start(intool.job_from_fields(fields(action="a, wait:30s", s="0", ms="1"), need_hotkey=False))
+        self._wait_until(lambda: len(engine.pulses) == 1)
+        self.assertIsNone(engine.remaining())
+        engine.stop()
 
     def test_motion_flag_follows_the_recording(self):
         engine = self.FakeEngine()
@@ -1932,18 +2066,18 @@ class EngineTests(unittest.TestCase):
 
         engine._open_source = fail
         with mock.patch.object(intool, "open_pointer", return_value=None):
-            engine.start_listener(intool.parse_hotkeys("f8"))
+            engine.start_listener([intool.parse_hotkey("f8")])
             engine.start_recording()
             self._wait_until(lambda: not engine.recording and not engine.listening)
         self.assertIn("error", events)
 
     def test_listener_hotkey_can_be_swapped_without_restart(self):
         engine = self.FakeEngine()
-        first = intool.parse_hotkey("f7")
-        second = intool.parse_hotkey("f9")
-        engine._hotkey = first
+        first = [intool.parse_hotkey("f7")]
+        second = [intool.parse_hotkey("f9"), intool.parse_hotkey("f6")]
+        engine.set_hotkey(first)
         engine.set_hotkey(second)
-        self.assertIs(engine._hotkey, second)
+        self.assertEqual(engine._hotkey, second)
 
     @staticmethod
     def _wait_until(predicate, timeout=5.0):
@@ -1991,10 +2125,12 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(self.root.resizable(), (True, True))
         self.assertGreater(self.root.minsize()[0], 0)
 
-    def test_state_change_loads_that_states_hotkey(self):
+    def test_state_change_keeps_the_single_hotkey(self):
+        self.app.set_entry("hotkey", "f5")
         self.app.on_state_change(self.event_from("press"))
-        self.assertEqual(self.app.entries["hotkey"].get(), intool.DEFAULT_HOTKEYS["press"])
-        self.assertEqual(self.app.labels["hotkey"].cget("text"), "Hotkey (press):")
+        self.assertEqual(self.app.state_selection, "press")
+        self.assertEqual(self.app.entries["hotkey"].get(), "f5")
+        self.assertEqual(self.app.labels["hotkey"].cget("text"), "Hotkey:")
 
     def test_hotkey_entry_is_disabled_while_listening(self):
         self.app.engine.listening = True
@@ -2013,6 +2149,8 @@ class GuiSmokeTests(unittest.TestCase):
     def test_settings_and_popups_open_without_errors(self):
         self.app.open_settings()
         self.app.open_recording_settings()
+        self.app.open_system()
+        self.app.open_bindings()
         self.app.open_info()
         self.app.show_message("Test", "message body")
         self.root.update()
@@ -2112,8 +2250,17 @@ class GuiSmokeTests(unittest.TestCase):
         self.app.save_config()
         self.assertTrue(intool.read_config(self.config)["immediate"])
         self.assertTrue(intool.job_from_fields(self.app.current_fields(), need_hotkey=False).immediate)
+        self.app.immediate_var.set(False)
+        self.app.save_config()
+        self.assertFalse(intool.read_config(self.config)["immediate"])
         self.app.delete_config()
-        self.assertFalse(self.app.immediate_var.get())
+        self.assertTrue(self.app.immediate_var.get())
+
+    def test_new_installs_use_one_second_and_act_immediately(self):
+        self.assertEqual(self.app.entries["s"].get(), "1")
+        self.assertEqual(self.app.entries["h"].get(), "0")
+        self.assertTrue(self.app.immediate_var.get())
+        self.assertEqual(self.app.entries["hotkey"].get(), intool.DEFAULT_HOTKEY)
 
     def test_unmap_hides_to_the_tray_only_when_enabled_and_available(self):
         shown = []
@@ -2143,6 +2290,96 @@ class GuiSmokeTests(unittest.TestCase):
         self.app.restore_window()
         self.assertEqual(hidden, [True])
         self.assertEqual(self.app.root.wm_state(), "normal")
+
+    def open_windows(self):
+        return [w for w in self.root.winfo_children() if isinstance(w, intool.tk.Toplevel)]
+
+    def test_settings_windows_fit_the_screen_and_do_not_block_the_main_window(self):
+        for opener in (self.app.open_settings, self.app.open_recording_settings,
+                       self.app.open_system, self.app.open_bindings):
+            opener()
+        self.root.update()
+        for win in self.open_windows():
+            with self.subTest(title=win.title()):
+                self.assertLessEqual(win.winfo_reqheight(), self.root.winfo_screenheight() * 0.85)
+                self.assertLess(win.minsize()[1], 250)
+                self.assertIsNone(win.grab_current())
+
+    def test_a_short_screen_makes_the_settings_scroll(self):
+        with mock.patch.object(intool.tk.Toplevel, "winfo_screenheight", return_value=500):
+            self.app.open_settings()
+        win = self.open_windows()[0]
+        self.root.update()
+        self.assertLessEqual(win.winfo_reqheight(), 500 * 0.8 + 2)
+        self.assertTrue(win.winfo_children()[0].winfo_manager() or win.winfo_children()[1].winfo_manager())
+
+    def test_recording_gear_sits_next_to_the_record_button(self):
+        self.assertEqual(self.app.record_gear_btn.cget("text"), "⚙")
+        self.assertEqual(self.app.record_gear_btn.grid_info()["row"], self.app.record_btn.grid_info()["row"])
+        self.assertEqual(self.app.record_gear_btn.master, self.app.record_btn.master)
+
+    def test_settings_no_longer_hold_the_recording_or_system_options(self):
+        self.app.open_settings()
+        texts = []
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                try:
+                    texts.append(child.cget("text"))
+                except intool.tk.TclError:
+                    pass
+                walk(child)
+
+        walk(self.open_windows()[0])
+        self.assertNotIn("Recording Settings", texts)
+        self.assertIn("System", texts)
+        self.assertIn("Extra Hotkeys", texts)
+        self.assertNotIn("Minimize to tray (needs the pystray and Pillow packages)", texts)
+
+    def test_status_shows_a_countdown_while_running(self):
+        self.app.engine.running = True
+        self.app.engine.deadline = time.monotonic() + 5
+        self.app.refresh_status()
+        self.assertRegex(self.app.counter_label.cget("text"), r"^Next trigger in [45]\.\ds$")
+        self.app.engine.deadline = None
+        self.app.refresh_status()
+        self.assertEqual(self.app.counter_label.cget("text"), "Acting...")
+        self.app.engine.running = False
+        self.app.refresh_status()
+        self.assertEqual(self.app.counter_label.cget("text"), "")
+
+    def test_extra_hotkeys_are_saved_validated_and_fired(self):
+        editor = intool.tk.Text(self.root)
+        win = intool.tk.Toplevel(self.root)
+        editor.insert("1.0", "f7 = space\nbad line")
+        self.app.save_bindings(editor, win)
+        self.root.update()
+        self.assertEqual(self.app.bindings, [])
+        editor.delete("1.0", intool.tk.END)
+        editor.insert("1.0", "f7 = space, wait:1s, a")
+        self.app.save_bindings(editor, win)
+        self.assertEqual(self.app.bindings, ["f7 = space, wait:1s, a"])
+        self.assertEqual(intool.read_config(self.config)["bindings"], ["f7 = space, wait:1s, a"])
+        chords = self.app.listener_chords()
+        self.assertEqual(len(chords), 2)
+        started = []
+        self.app.engine.start = lambda job: started.append(job) or True
+        self.app.run_binding(1)
+        self.assertEqual([kind for kind, _ in started[0].steps], ["press", "wait", "press"])
+        self.assertEqual(self.app.active_binding, 1)
+        self.app.run_binding(0)
+        self.assertEqual(started[1].steps, intool.parse_sequence(self.app.entries["action"].get()))
+        self.assertEqual(self.app.active_binding, 0)
+
+    def test_pressing_the_active_hotkey_again_stops_the_job(self):
+        calls = []
+        self.app.engine.running = True
+        self.app.active_binding = 0
+        self.app.engine.stop = lambda: calls.append("stop")
+        self.app.engine.start = lambda job: calls.append("start")
+        self.app.run_binding(0)
+        self.assertEqual(calls, ["stop"])
+        self.app.engine.running = False
 
     def test_scheduled_events_start_and_stop_the_job(self):
         calls = []
@@ -2187,10 +2424,11 @@ class GuiSmokeTests(unittest.TestCase):
     def test_save_config_writes_hotkeys_and_options(self):
         self.app.save_config()
         saved = intool.read_config(self.config)
-        self.assertIn("hotkeys", saved)
+        self.assertEqual(saved["hotkey"], intool.DEFAULT_HOTKEY)
+        self.assertEqual(saved["bindings"], [])
         self.assertEqual(saved["state"], self.app.state_selection)
         self.assertEqual(saved["device"], self.app.device_selection)
-        self.assertNotIn("hotkey", saved)
+        self.assertNotIn("hotkeys", saved)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from os.path import join as joinp
 
 try:
@@ -43,7 +43,7 @@ AUTOSTART_FILE = "intool.desktop"
 RESCAN_SECONDS = 3.0
 DRAIN_READS = 256
 SCROLL_NOTCH = 120
-CHORD_TIMEOUT = 1.5
+MIN_CLICK = 0.02
 
 EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
 REL_X, REL_Y, REL_HWHEEL, REL_WHEEL, REL_WHEEL_HI_RES = 0, 1, 6, 8, 11
@@ -87,7 +87,7 @@ SCROLL_ACTIONS = {"scrollup": 1, "scrolldown": -1}
 STATES = ("press", "release", "press & release")
 DEVICES = ("wheel", "touchpad", "pinch")
 OPTION_DEFAULTS = {"state": "press & release", "device": "wheel", "interval": "100ms", "value": "120"}
-DEFAULT_HOTKEYS = {"press": "f7", "release": "f9", "press & release": "f8"}
+DEFAULT_HOTKEY = "f8"
 
 
 KEY_ALIASES = {
@@ -149,7 +149,7 @@ CODE_NAMES.update(
 )
 
 DEFAULTS = {
-    "h": "0", "m": "0", "s": "5", "ms": "0",
+    "h": "0", "m": "0", "s": "1", "ms": "0",
     "clicks": "1", "repeat": "0", "action": "mouse0",
 }
 
@@ -187,7 +187,7 @@ class Job:
     repeats: int
     per_trigger: int
     steps: tuple
-    hotkey: tuple = None
+    hotkey: list = None
     state: str = "press & release"
     interval: float = 0.1
     value: int = 120
@@ -302,19 +302,41 @@ def parse_sequence(text):
 
 def parse_hotkey(text):
     parts = [p.strip() for p in (text or "").lower().split("+") if p.strip()]
-    if not parts or parts[-1] not in KEYS:
-        return None
-    mod_sets = []
-    for part in parts[:-1]:
-        if part not in MODS:
+    chord = []
+    for part in parts:
+        codes = MODS.get(part) or ({KEYS[part]} if part in KEYS else None)
+        if codes is None:
             return None
-        mod_sets.append(MODS[part])
-    return mod_sets, KEYS[parts[-1]]
+        chord.append(codes)
+    return chord or None
 
 
-def parse_hotkeys(text):
-    chords = [parse_hotkey(part) for part in (text or "").split(",") if part.strip()]
-    return tuple(chords) if chords and None not in chords else None
+def parse_binding(text):
+    hotkey_text, separator, action_text = (text or "").partition("=")
+    if not separator or parse_hotkey(hotkey_text) is None:
+        raise ValueError(f"unknown hotkey in '{(text or '').strip()}' (write HOTKEY = ACTION)")
+    steps = parse_sequence(action_text)
+    if steps is None:
+        raise ValueError(f"invalid action in '{(text or '').strip()}'")
+    return parse_hotkey(hotkey_text), steps
+
+
+def parse_bindings(text):
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    for line in lines:
+        parse_binding(line)
+    return lines
+
+
+def valid_bindings(values):
+    lines = []
+    for value in values if isinstance(values, list) else []:
+        try:
+            parse_binding(str(value))
+        except ValueError:
+            continue
+        lines.append(str(value).strip())
+    return lines
 
 
 def to_bool(value):
@@ -359,7 +381,7 @@ def job_from_fields(fields, need_hotkey=True):
     steps = parse_sequence(fields["action"])
     if steps is None:
         raise ValueError(f"Invalid action '{fields['action']}' (see --list-keys for the syntax).")
-    hotkey = parse_hotkeys(fields["hotkey"])
+    hotkey = parse_hotkey(fields["hotkey"])
     if hotkey is None and need_hotkey:
         raise ValueError(f"Unknown key in the hotkey '{fields['hotkey']}'.")
     state = match_choice(fields.get("state"), STATES)
@@ -411,13 +433,13 @@ def parse_screen(text):
     return int(size[1]), int(size[2])
 
 
-def parse_optional_hotkeys(text):
+def parse_optional_hotkey(text):
     if not (text or "").strip():
         return None
-    chords = parse_hotkeys(text)
-    if chords is None:
+    chord = parse_hotkey(text)
+    if chord is None:
         raise ValueError(f"unknown key in '{text}'")
-    return chords
+    return chord
 
 
 def parse_command(text):
@@ -489,7 +511,7 @@ OPTIONS = (
     Option("screen", "Screen size (auto or WxH)", "auto", parse=parse_screen),
     Option("pointer_command", "Pointer command (auto, or a command printing X Y)", "auto", parse=parse_command),
     Option("record_hotkey", "Recording hotkey (empty = none)", "f10",
-           parse=parse_optional_hotkeys, group="recording"),
+           parse=parse_optional_hotkey, group="recording"),
     Option("record_pointer", "Record pointer", POINTER_MODES[1], "choice", POINTER_MODES, group="recording"),
     Option("record_coordinates", "Pointer coordinates", COORDINATES[0], "choice", COORDINATES,
            group="recording"),
@@ -498,8 +520,6 @@ OPTIONS = (
     Option("record_path_interval", "Path sample interval", "50ms", parse=parse_duration, group="recording"),
     Option("record_trim_click", "Leave out the Stop Recording click", True, "bool", group="recording"),
     Option("record_drop_held", "Drop keys still held at the end", True, "bool", group="recording"),
-    Option("record_estimate", "Estimate an unreadable pointer from motion (starts at the screen center)",
-           False, "bool", group="recording"),
     Option("minimize_to_tray", "Minimize to tray (needs the pystray and Pillow packages)", False, "bool",
            group="system"),
     Option("schedule", "Start and stop on a daily schedule", False, "bool", group="system"),
@@ -529,14 +549,13 @@ def valid_options(values):
     return cleaned
 
 
-def resolve_hotkeys(data, state):
-    hotkeys = dict(DEFAULT_HOTKEYS)
+def resolve_hotkey(data, state):
     stored = data.get("hotkeys")
-    if isinstance(stored, dict):
-        hotkeys.update({k: str(v) for k, v in stored.items() if k in STATES})
-    elif data.get("hotkey"):
-        hotkeys[state] = str(data["hotkey"])
-    return hotkeys
+    if data.get("hotkey"):
+        return str(data["hotkey"])
+    if isinstance(stored, dict) and stored.get(state):
+        return str(stored[state])
+    return DEFAULT_HOTKEY
 
 
 def xdg_config_home():
@@ -687,15 +706,30 @@ class Injector:
 
     def __init__(self):
         self.held = []
+        self.pressed_at = {}
 
     def set_screen(self, size):
         self.screen = size
 
+    def _hold_long_enough(self, code):
+        started = self.pressed_at.pop(code, None)
+        if started is not None and time.monotonic() - started < MIN_CLICK:
+            self.flush()
+            time.sleep(MIN_CLICK - (time.monotonic() - started))
+
+    def _press(self, code, down):
+        if code in MOUSE_CODES:
+            if down:
+                self.pressed_at[code] = time.monotonic()
+            else:
+                self._hold_long_enough(code)
+        self.key(code, down)
+        self._track(code, down)
+
     def pulse(self, spec):
         for step in plan(spec):
             if step[0] == "key":
-                self.key(step[1], step[2])
-                self._track(step[1], step[2])
+                self._press(step[1], step[2])
             elif step[0] == "wheel":
                 self.wheel(step[1], step[2])
             elif step[0] == "move":
@@ -721,8 +755,10 @@ class Injector:
 
     def release_all(self):
         for code in reversed(self.held):
+            self._hold_long_enough(code)
             self.key(code, False)
         self.held.clear()
+        self.pressed_at.clear()
         self.flush()
 
     def flush(self):
@@ -841,7 +877,11 @@ class UInputPointer(UInputDevice):
     def move_to(self, x, y):
         x = min(max(x, 0), self.size[0] - 1)
         y = min(max(y, 0), self.size[1] - 1)
+        if getattr(self, "last", (0, 0)) == (x, y):
+            nudge = x + 1 if x < self.size[0] - 1 else x - 1
+            self._emit([(EV_ABS, ABS_X, nudge), (EV_SYN, 0, 0)])
         self._emit([(EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y), (EV_SYN, 0, 0)])
+        self.last = (x, y)
 
 
 class X11Connection:
@@ -1423,13 +1463,17 @@ class LinuxInput:
             "or run under X11, or allow the root helper prompt."
         )
 
-    def injector(self):
+    @staticmethod
+    def _no_helper():
+        raise BackendError("the root helper is not started for a pointer estimate")
+
+    def injector(self, helper=True):
         with self._lock:
             if self._injector is None:
                 self._injector = self._first({
                     "uinput": UInputDevice,
                     "xtest": XTestInput,
-                    "helper": self._get_helper,
+                    "helper": self._get_helper if helper else self._no_helper,
                 })
                 self._injector.set_screen(self.screen or probe_screen())
             return self._injector
@@ -1469,39 +1513,19 @@ class LinuxInput:
 
 
 class HotkeyMatcher:
-    def __init__(self, chords, any_order=False):
-        self.chords = chords
+    def __init__(self, chord, any_order=False):
+        self.chord = chord
         self.any_order = any_order
-        self.index = 0
-        self.deadline = 0.0
 
-    def _completes(self, chord, code, pressed):
-        mod_sets, target = chord
-        if not all(pressed & mods for mods in mod_sets):
+    def feed(self, code, pressed):
+        if not all(pressed & part for part in self.chord):
             return False
-        if code == target:
-            return True
-        return self.any_order and target in pressed and any(code in mods for mods in mod_sets)
-
-    def feed(self, code, pressed, now):
-        if now > self.deadline:
-            self.index = 0
-        for index in dict.fromkeys((self.index, 0)):
-            if self._completes(self.chords[index], code, pressed):
-                self.index = index + 1
-                self.deadline = now + CHORD_TIMEOUT
-                if self.index == len(self.chords):
-                    self.index = 0
-                    return True
-                return False
-        if code not in MODIFIER_CODES:
-            self.index = 0
-        return False
+        if self.any_order:
+            return any(code in part for part in self.chord)
+        return code in self.chord[-1]
 
     def codes(self):
-        return {code for mod_sets, target in self.chords for mods in mod_sets for code in mods} | {
-            target for _, target in self.chords
-        }
+        return set().union(*self.chord)
 
 
 @dataclass(frozen=True)
@@ -1513,14 +1537,13 @@ class RecordOptions:
     path_interval: float = 0.05
     trim_click: bool = True
     drop_held: bool = True
-    estimate: bool = False
 
     @classmethod
     def from_options(cls, options):
         return cls(
             options["record_pointer"], options["record_coordinates"], options["record_waits"],
             options["record_min_wait"], max(0.005, options["record_path_interval"]),
-            options["record_trim_click"], options["record_drop_held"], options["record_estimate"],
+            options["record_trim_click"], options["record_drop_held"],
         )
 
 
@@ -1662,6 +1685,14 @@ class Recorder:
             if self.pointer is not None:
                 self.pointer.close()
         return ", ".join(format_step(step) for step in steps)
+
+
+def format_countdown(seconds):
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
 def format_step(step):
@@ -1906,16 +1937,18 @@ class Engine:
         self.linux = LinuxInput(backend) if IS_LINUX else None
         self.windows = WindowsInput() if IS_WIN else None
         self.job = None
+        self.jobs = []
+        self.deadline = None
         self.running = False
         self.listening = False
         self.recording = False
         self.record_options = RecordOptions()
-        self.record_chords = None
+        self.record_chord = None
         self.any_order = False
         self.move_mode = MOVE_MODES[0]
         self.pointer_command = None
         self._screen = False
-        self._hotkey = None
+        self._hotkey = []
         self._recorder = None
         self._monitor_running = False
         self._cursor = None
@@ -1939,7 +1972,7 @@ class Engine:
     def configure(self, values):
         options = resolve_options(values)
         self.record_options = RecordOptions.from_options(options)
-        self.record_chords = options["record_hotkey"]
+        self.record_chord = options["record_hotkey"]
         self.any_order = options["hotkey_order"] == HOTKEY_ORDERS[1]
         self.move_mode = options["move_mode"]
         self.pointer_command = options["pointer_command"]
@@ -1965,12 +1998,21 @@ class Engine:
             self._scheduler = Scheduler(start, stop, lambda action: self._emit("scheduled", action))
             self._scheduler.begin()
 
-    def _estimate_pointer(self):
-        size = self._screen or probe_screen()
-        if size is None:
-            raise BackendError("Estimating the pointer needs the screen size; set Screen size in Settings.")
-        origin = (size[0] // 2, size[1] // 2)
-        self._execute({"kind": "pos", "payload": origin})
+    def _estimate_pointer(self, required):
+        try:
+            size = self._screen or probe_screen()
+            if size is None:
+                raise BackendError("Estimating the pointer needs the screen size; set Screen size in Settings.")
+            origin = (size[0] // 2, size[1] // 2)
+            warp = {"kind": "pos", "payload": origin}
+            if self.linux is not None:
+                self.linux.injector(helper=required).pulse(warp)
+            else:
+                self._execute(warp)
+        except (BackendError, OSError):
+            if required:
+                raise
+            return None
         self._cursor = origin
         return MotionPointer(origin, size)
 
@@ -2045,6 +2087,12 @@ class Engine:
         if was_running:
             self._emit("state")
 
+    def remaining(self):
+        deadline = self.deadline
+        if deadline is None or not self.running:
+            return None
+        return max(0.0, deadline - time.monotonic())
+
     def toggle(self):
         if self.running:
             self.stop()
@@ -2075,8 +2123,10 @@ class Engine:
             deadline = time.monotonic() + (0.0 if job.immediate else job.delay)
             count = 0
             while not stop.is_set() and (job.repeats == 0 or count < job.repeats):
+                self.deadline = deadline
                 if stop.wait(max(0.0, deadline - time.monotonic())):
                     break
+                self.deadline = None
                 for _ in range(job.per_trigger):
                     if not self._play(specs, stop):
                         break
@@ -2092,24 +2142,25 @@ class Engine:
                 owner = self._stop is stop
                 if owner:
                     self.running = False
+                    self.deadline = None
             if owner:
                 self._release()
                 if completed:
                     self._emit("finished")
                 self._emit("state")
 
-    def start_listener(self, hotkey):
+    def start_listener(self, hotkeys):
         with self._lock:
             if self.listening:
                 return False
             self.listening = True
-            self._hotkey = hotkey
+            self._hotkey = list(hotkeys)
         self._ensure_monitor()
         self._emit("state")
         return True
 
-    def set_hotkey(self, hotkey):
-        self._hotkey = hotkey
+    def set_hotkey(self, hotkeys):
+        self._hotkey = list(hotkeys)
 
     def stop_listener(self):
         with self._lock:
@@ -2119,8 +2170,18 @@ class Engine:
         if was_listening:
             self._emit("state")
 
-    def _fire(self):
-        (self.on_hotkey or self.toggle)()
+    def _fire(self, index=0):
+        (self.on_hotkey or self.toggle_binding)(index)
+
+    def toggle_binding(self, index):
+        job = self.jobs[index] if index < len(self.jobs) else None
+        if job is None:
+            return
+        current = self.job if self.running else None
+        if self.running:
+            self.stop()
+        if current is not job:
+            self.start(job)
 
     def _open_source(self):
         if IS_LINUX:
@@ -2161,16 +2222,17 @@ class Engine:
             self._emit("state")
             self._ensure_monitor()
 
-    def _matcher(self, current, chords):
-        if not chords:
+    def _matcher(self, current, chord):
+        if not chord:
             return None
-        if current is None or current.chords is not chords or current.any_order != self.any_order:
-            return HotkeyMatcher(chords, self.any_order)
+        if current is None or current.chord is not chord or current.any_order != self.any_order:
+            return HotkeyMatcher(chord, self.any_order)
         return current
 
     def _pump(self, source):
         pressed = set()
-        job_matcher = record_matcher = None
+        job_matchers, watching = [], None
+        record_matcher = None
         motion = None
         while self.listening or self.recording:
             recorder = self._recorder
@@ -2178,8 +2240,11 @@ class Engine:
             if wants_motion != motion:
                 source.set_motion(wants_motion)
                 motion = wants_motion
-            job_matcher = self._matcher(job_matcher, self._hotkey if self.listening else None)
-            record_matcher = self._matcher(record_matcher, self.record_chords)
+            chords = list(self._hotkey) if self.listening else []
+            if (chords, self.any_order) != watching:
+                job_matchers = [HotkeyMatcher(chord, self.any_order) for chord in chords]
+                watching = (chords, self.any_order)
+            record_matcher = self._matcher(record_matcher, self.record_chord)
             for code, value in source.poll(recorder.poll_timeout() if recorder else 0.25):
                 recorder = self._recorder
                 if code < 0:
@@ -2194,10 +2259,12 @@ class Engine:
                     recorder.feed(code, value)
                 if not value:
                     continue
-                now = time.monotonic()
-                if job_matcher and job_matcher.feed(code, pressed, now) and not self.recording:
-                    self._fire()
-                if record_matcher and record_matcher.feed(code, pressed, now):
+                if not self.recording:
+                    for index, matcher in enumerate(job_matchers):
+                        if matcher.feed(code, pressed):
+                            self._fire(index)
+                            break
+                if record_matcher and record_matcher.feed(code, pressed):
                     self._toggle_recording(record_matcher)
             recorder = self._recorder
             if recorder is not None:
@@ -2218,8 +2285,8 @@ class Engine:
             try:
                 if options.pointer != "off":
                     pointer = open_pointer(self.pointer_command)
-                    if pointer is None and options.estimate and options.coordinates != "relative":
-                        pointer = self._estimate_pointer()
+                    if pointer is None and options.coordinates != "relative":
+                        pointer = self._estimate_pointer(options.coordinates == "absolute")
                     if pointer is None and options.coordinates == "absolute":
                         raise BackendError(
                             "Absolute pointer positions are not available here; "
@@ -2347,17 +2414,19 @@ class App:
         self.device_selection = pick(data.get("device"), DEVICES, OPTION_DEFAULTS["device"])
         self.interval_var = tk.StringVar(value=str(data.get("interval", OPTION_DEFAULTS["interval"])))
         self.value_var = tk.StringVar(value=str(data.get("value", OPTION_DEFAULTS["value"])))
-        self.immediate_var = tk.BooleanVar(value=to_bool(data.get("immediate", False)))
+        self.immediate_var = tk.BooleanVar(value=to_bool(data.get("immediate", True)))
+        self.bindings = valid_bindings(data.get("bindings"))
+        self.active_binding = 0
+        self._counter = None
         options = valid_options(data)
         self.option_vars = {
             option.key: (tk.BooleanVar if option.kind == "bool" else tk.StringVar)(value=options[option.key])
             for option in OPTIONS
         }
-        self.hotkeys = resolve_hotkeys(data, self.state_selection)
 
         self.engine = Engine(
             self._engine_event, self.backend_selection,
-            on_hotkey=lambda: self._engine_event("hotkey"),
+            on_hotkey=lambda index: self._engine_event("hotkey", index),
         )
         self.engine.configure(options)
         self.tray = Tray(
@@ -2370,8 +2439,7 @@ class App:
         self.build_ui()
         for key, default in DEFAULTS.items():
             self.set_entry(key, data.get(key, default))
-        self.set_entry("hotkey", self.hotkeys[self.state_selection])
-        self.update_hotkey_title()
+        self.set_entry("hotkey", resolve_hotkey(data, self.state_selection))
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.bind_all("<Button-1>", self._on_root_click, add="+")
@@ -2433,7 +2501,7 @@ class App:
         elif event == "recorded":
             self.apply_recording(args[0])
         elif event == "hotkey":
-            self.toggle_clicking()
+            self.run_binding(args[0])
         elif event == "scheduled":
             self.run_schedule(args[0])
 
@@ -2512,16 +2580,17 @@ class App:
         win.update_idletasks()
         win.minsize(win.winfo_reqwidth(), win.winfo_reqheight())
 
-    def _window(self, title):
+    def _window(self, title, modal=True):
         win = tk.Toplevel(self.root)
         win.title(title)
         win.resizable(True, True)
         win.transient(self.root)
         self._themed_widget(win, "window")
-        try:
-            win.grab_set()
-        except tk.TclError:
-            pass
+        if modal:
+            try:
+                win.grab_set()
+            except tk.TclError:
+                pass
         return win
 
     def _combo(self, parent, values, current, handler):
@@ -2571,10 +2640,17 @@ class App:
         )
         self.listener_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 10))
 
+        record_row = self._frame(main)
+        record_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        record_row.columnconfigure(0, weight=1)
         self.record_btn = self._button(
-            main, "Start Recording", self.toggle_recording, font=("Arial", 9, "bold"), width=16,
+            record_row, "Start Recording", self.toggle_recording, font=("Arial", 9, "bold"), width=16,
         )
-        self.record_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        self.record_btn.grid(row=0, column=0, sticky="ew")
+        self.record_gear_btn = self._button(
+            record_row, "⚙", self.open_recording_settings, font=("Arial", 9), width=2,
+        )
+        self.record_gear_btn.grid(row=0, column=1, sticky="ns", padx=(8, 0))
 
         btn_frame = self._frame(main)
         btn_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 12))
@@ -2597,6 +2673,10 @@ class App:
             status_row, "⚙", self.open_settings, font=("Arial", 9), width=2, height=1,
         )
         self.gear_btn.pack(side=tk.RIGHT)
+        self.counter_label = self._themed_widget(
+            tk.Label(main, text="", anchor="w", font=("Arial", 9)), "muted",
+        )
+        self.counter_label.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         self.refresh_status()
 
     def set_entry(self, key, value):
@@ -2615,9 +2695,6 @@ class App:
         except (AttributeError, tk.TclError):
             pass
 
-    def update_hotkey_title(self):
-        self.labels["hotkey"].configure(text=f"Hotkey ({self.state_selection}):")
-
     def refresh_status(self):
         if self.engine.running:
             text, color = "Status: Running...", self.status_running
@@ -2628,6 +2705,26 @@ class App:
         else:
             text, color = "Status: Idle", self.status_idle
         self.status_label.configure(text=text, fg=color)
+        self.refresh_counter()
+
+    def refresh_counter(self):
+        remaining = self.engine.remaining()
+        if not self.engine.running:
+            text = ""
+        elif remaining is None:
+            text = "Acting..."
+        else:
+            text = f"Next trigger in {format_countdown(remaining)}"
+        self.counter_label.configure(text=text)
+
+    def _counter_tick(self):
+        self._counter = None
+        self.refresh_counter()
+        self._schedule_counter()
+
+    def _schedule_counter(self):
+        if self.engine.running and self._counter is None:
+            self._counter = self.root.after(100, self._counter_tick)
 
     def sync_state(self):
         engine = self.engine
@@ -2641,6 +2738,7 @@ class App:
         )
         self.entries["hotkey"].configure(state="disabled" if engine.listening else "normal")
         self.refresh_status()
+        self._schedule_counter()
 
     def set_backend_label(self, label):
         self.root.title(f"{APP_NAME} · {label}")
@@ -2670,8 +2768,8 @@ class App:
             "• Delay: hours, minutes, seconds and milliseconds between triggers.\n"
             "• Actions per trigger: how many times the Action is performed each cycle.\n"
             "• Repeat cycles: number of cycles (0 = forever).\n"
-            "• Hotkey: starts/stops the job for the selected key state (f6, ctrl+f6, up). "
-            "Separate chords with commas for a sequence (ctrl+k, ctrl+c).\n"
+            "• Hotkey: starts/stops the job (f6, ctrl+f6, up); join keys with + to press them together "
+            "(ctrl+k+c). Extra Hotkeys (Settings) bind more hotkeys to other actions.\n"
             "• Action: key, mouse button, combo or scroll (mouse0=left, mouse1=right, "
             "mouse2=middle, mouse3=back, mouse4=forward; scrollup/scrolldown; "
             "e, space, enter, tab, f1-f12, ctrl+z, ctrl+left …). Separate steps with commas "
@@ -2682,9 +2780,10 @@ class App:
             "To play a recording once, turn on Act immediately on start and set Repeat cycles to 1. "
             "Recording is unavailable while a job runs; the job hotkey is ignored while recording.\n"
             "• Settings: Hotkey order, Relative movement (exact or device), Screen size (detected on "
-            "X11 and most Wayland compositors; needed for exact positions through uinput), Pointer "
-            "command (reads the pointer on Wayland, e.g. hyprctl cursorpos) and Recording settings "
-            "(pointer path, relative or absolute coordinates, waits, trimming).\n"
+            "X11 and most Wayland compositors; needed for exact positions through uinput) and Pointer "
+            "command (reads the pointer on Wayland, e.g. hyprctl cursorpos). The gear next to Start "
+            "Recording opens the recording settings (pointer path, relative or absolute coordinates, "
+            "waits, trimming).\n"
             "• Key state (Settings): press holds the key or button down until released, "
             "release lets it go, press & release taps it with the Interval in between. "
             "Wheel and touchpad ignore release.\n"
@@ -2740,13 +2839,43 @@ class App:
         return row + 1
 
     def _settings_frame(self, win):
-        frame = self._frame(win, padx=26, pady=22)
-        frame.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(win, highlightthickness=0, bd=0)
+        self._themed_widget(canvas, "frame")
+        bar = tk.Scrollbar(win, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        frame = self._frame(canvas, padx=26, pady=22)
         frame.columnconfigure(1, weight=1, minsize=220)
+        item = canvas.create_window((0, 0), window=frame, anchor="nw")
+        frame.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(item, width=event.width))
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def scroll(event):
+            step = -1 if getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0 else 1
+            if canvas.yview() != (0.0, 1.0):
+                canvas.yview_scroll(step, "units")
+
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            win.bind(sequence, scroll)
+            canvas.bind(sequence, scroll)
+            frame.bind(sequence, scroll, add="+")
+        frame.canvas, frame.bar = canvas, bar
         return frame
 
+    def _fit_scrolling(self, win, frame):
+        win.update_idletasks()
+        limit = int(win.winfo_screenheight() * 0.8)
+        height = min(frame.winfo_reqheight(), limit)
+        frame.canvas.configure(width=frame.winfo_reqwidth(), height=height)
+        if frame.winfo_reqheight() > limit:
+            frame.canvas.pack_forget()
+            frame.bar.pack(side=tk.RIGHT, fill=tk.Y)
+            frame.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        win.update_idletasks()
+        win.minsize(win.winfo_reqwidth(), min(height, 200))
+
     def open_settings(self):
-        win = self._window("Settings")
+        win = self._window("Settings", modal=False)
         frame = self._settings_frame(win)
 
         row = self._section(frame, "Appearance", 0)
@@ -2780,16 +2909,16 @@ class App:
         row = self._section(frame, "Advanced", row)
         row = self._option_rows(frame, "input", row)
 
-        row = self._section(frame, "System", row)
-        row = self._option_rows(frame, "system", row)
-
         row = self._section(frame, "Manage", row)
+        row = self._action_row(frame, row, (
+            ("System", self.open_system),
+            ("Extra Hotkeys", self.open_bindings),
+        ))
         self._action_row(frame, row, (
-            ("Recording Settings", self.open_recording_settings),
             ("Open Config Dir", self.open_config_dir),
             ("Delete Config", self.delete_config),
         ))
-        self._set_minsize(win)
+        self._fit_scrolling(win, frame)
 
     def _option_rows(self, frame, group, row):
         options = [option for option in OPTIONS if option.group == group]
@@ -2808,11 +2937,50 @@ class App:
             row = self._toggle(frame, row, option.label, self.option_vars[option.key], self.commit_settings)
         return row
 
+    def open_bindings(self):
+        win = self._window("Extra Hotkeys", modal=False)
+        frame = self._settings_frame(win)
+        note = tk.Label(
+            frame, text="One per line: HOTKEY = ACTION, for example f7 = space, wait:1s, a",
+            anchor="w", font=("Arial", 8),
+        )
+        self._themed_widget(note, "muted")
+        note.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        editor = tk.Text(
+            frame, width=48, height=8, font=("Arial", 10), relief=tk.FLAT, highlightthickness=1, wrap=tk.NONE,
+        )
+        self._themed_widget(editor, "text")
+        editor.insert("1.0", "\n".join(self.bindings))
+        editor.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 10))
+        frame.rowconfigure(1, weight=1)
+        self._action_row(frame, 2, (("Save", lambda: self.save_bindings(editor, win)),))
+        self._fit_scrolling(win, frame)
+
+    def save_bindings(self, editor, win):
+        try:
+            lines = parse_bindings(editor.get("1.0", tk.END))
+        except ValueError as exc:
+            self.show_error_popup("Invalid Hotkeys", str(exc))
+            return
+        self.bindings = lines
+        self.save_config()
+        if self.engine.listening:
+            chords = self.listener_chords()
+            if chords is not None:
+                self.engine.set_hotkey(chords)
+        win.destroy()
+
     def open_recording_settings(self):
-        win = self._window("Recording Settings")
+        win = self._window("Recording Settings", modal=False)
         frame = self._settings_frame(win)
         self._option_rows(frame, "recording", 0)
-        self._set_minsize(win)
+        self._fit_scrolling(win, frame)
+
+    def open_system(self):
+        win = self._window("System", modal=False)
+        frame = self._settings_frame(win)
+        self._option_rows(frame, "system", 0)
+        self._fit_scrolling(win, frame)
 
     def on_option_choice(self, variable, value):
         variable.set(value)
@@ -2847,17 +3015,8 @@ class App:
         self.save_config()
 
     def on_state_change(self, event):
-        self.hotkeys[self.state_selection] = self.entries["hotkey"].get()
         self.state_selection = event.widget.get()
-        self.set_entry("hotkey", self.hotkeys[self.state_selection])
-        self.update_hotkey_title()
         self.save_config()
-        if self.engine.listening:
-            hotkey = parse_hotkeys(self.entries["hotkey"].get())
-            if hotkey is None:
-                self.show_error_popup("Invalid Hotkey", "Unknown key in the Hotkey field.")
-            else:
-                self.engine.set_hotkey(hotkey)
 
     def on_device_change(self, event):
         self.device_selection = event.widget.get()
@@ -3150,7 +3309,6 @@ class App:
         self.refresh_status()
 
     def save_config(self):
-        self.hotkeys[self.state_selection] = self.entries["hotkey"].get()
         data = {
             "theme": self.theme_selection,
             "backend": self.backend_selection,
@@ -3162,10 +3320,10 @@ class App:
             "interval": self.interval_var.get(),
             "value": self.value_var.get(),
             "immediate": self.immediate_var.get(),
-            "hotkeys": dict(self.hotkeys),
+            "bindings": list(self.bindings),
         }
         data.update(self.option_values())
-        data.update({key: entry.get() for key, entry in self.entries.items() if key != "hotkey"})
+        data.update({key: entry.get() for key, entry in self.entries.items()})
         write_config(self.configs, data)
 
     def open_config_dir(self):
@@ -3192,14 +3350,13 @@ class App:
         self.device_selection = OPTION_DEFAULTS["device"]
         self.interval_var.set(OPTION_DEFAULTS["interval"])
         self.value_var.set(OPTION_DEFAULTS["value"])
-        self.immediate_var.set(False)
+        self.immediate_var.set(True)
+        self.bindings = []
         for option in OPTIONS:
             self.option_vars[option.key].set(option.clean(None))
         self.engine.configure(self.option_values())
         self.apply_autostart()
-        self.hotkeys = dict(DEFAULT_HOTKEYS)
-        self.set_entry("hotkey", self.hotkeys[self.state_selection])
-        self.update_hotkey_title()
+        self.set_entry("hotkey", DEFAULT_HOTKEY)
         self.theme_selection = "Auto"
         self.backend_selection = "Auto"
         self.remember_pos_var.set(True)
@@ -3209,6 +3366,8 @@ class App:
 
     def on_closing(self):
         self.save_config()
+        if self._counter is not None:
+            self.root.after_cancel(self._counter)
         self.tray.hide()
         self.engine.shutdown()
         self.root.destroy()
@@ -3231,14 +3390,41 @@ class App:
             self.show_error_popup("Invalid Input", str(exc))
             return None
 
-    def start_clicking(self):
-        if self.engine.running or self.engine.recording:
-            return
+    def binding_job(self, index):
         job = self.build_job()
+        if job is None or index == 0:
+            return job
+        hotkey, steps = parse_binding(self.bindings[index - 1])
+        return replace(job, steps=steps, hotkey=hotkey)
+
+    def start_binding(self, index):
+        job = self.binding_job(index)
         if job is None:
             return
         self.save_config()
+        self.active_binding = index
         self.engine.start(job)
+
+    def start_clicking(self):
+        if self.engine.running or self.engine.recording:
+            return
+        self.start_binding(0)
+
+    def run_binding(self, index):
+        if self.engine.recording or index > len(self.bindings):
+            return
+        if self.engine.running:
+            self.engine.stop()
+            if self.active_binding == index:
+                return
+        self.start_binding(index)
+
+    def listener_chords(self):
+        primary = parse_hotkey(self.entries["hotkey"].get())
+        if primary is None:
+            self.show_error_popup("Invalid Hotkey", "Unknown key in the Hotkey field.")
+            return None
+        return [primary] + [parse_binding(line)[0] for line in self.bindings]
 
     def toggle_recording(self):
         if self.engine.recording:
@@ -3264,13 +3450,12 @@ class App:
         if self.engine.listening:
             self.engine.stop_listener()
             return
-        hotkey = parse_hotkeys(self.entries["hotkey"].get())
-        if hotkey is None:
-            self.show_error_popup("Invalid Hotkey", "Unknown key in the Hotkey field.")
+        chords = self.listener_chords()
+        if chords is None:
             return
         self.save_config()
         self.root.focus_set()
-        self.engine.start_listener(hotkey)
+        self.engine.start_listener(chords)
 
 
 def log(message, err=False):
@@ -3321,6 +3506,12 @@ def run_headless(fields, backend, listen, start, quiet):
     engine = Engine(notify, backend)
     engine.configure(fields)
     engine.job = job
+    engine.jobs = [job]
+    if listen:
+        engine.jobs += [
+            replace(job, steps=steps, hotkey=hotkey)
+            for hotkey, steps in map(parse_binding, fields.get("bindings", []))
+        ]
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -3331,7 +3522,7 @@ def run_headless(fields, backend, listen, start, quiet):
     say(f"action '{fields['action']}' {job.describe()}")
     if listen:
         say(f"press '{fields['hotkey']}' to start/stop, Ctrl+C to quit")
-        engine.start_listener(job.hotkey)
+        engine.start_listener([item.hotkey for item in engine.jobs])
     if start:
         engine.start(job)
 
@@ -3409,10 +3600,10 @@ def list_keys():
     print("scroll:  " + " ".join(sorted(SCROLL_ACTIONS)))
     print("states:  " + " | ".join(STATES))
     print("devices: " + " ".join(DEVICES))
-    print("combine: ctrl+shift+f6, ctrl+z, alt+tab, ...")
+    print("combine: ctrl+shift+f6, ctrl+z, alt+tab, k+c ...")
     print("steps:   separate with commas; tap by default, or down:KEY, up:KEY, wait:500ms,")
     print("         move:DX:DY (relative pointer), pos:X:Y (exact pointer position)")
-    print("hotkeys: separate chords with commas for a sequence: ctrl+k, ctrl+c")
+    print("hotkeys: join keys with + to press them together; more hotkeys with -B 'f7=space'")
     print("record:  -R records into an action (printed; --save keeps it); -s -r 1 -I plays it once")
 
 
@@ -3440,9 +3631,16 @@ def build_parser():
         return text
 
     def hotkey(text):
-        if parse_hotkeys(text) is None:
+        if parse_hotkey(text) is None:
             raise argparse.ArgumentTypeError(f"unknown key in '{text}' (see --list-keys)")
         return text
+
+    def binding(text):
+        try:
+            parse_binding(text)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc))
+        return text.strip()
 
     def option_text(option):
         def convert(text):
@@ -3474,7 +3672,8 @@ def build_parser():
             "  intool.pyw -n -S \"press & release\" -i 30ms -a space -s -r 5\n"
             "  intool.pyw -n -a scrollup -D pinch -v 240 -d 200ms -s -r 20   zoom in with ctrl+wheel\n"
             "  intool.pyw -n -a \"pos:400:300, mouse0, wait:1s, move:50:0, mouse0\" -s -r 1\n"
-            "  intool.pyw -n -k \"ctrl+k, ctrl+c\" -a mouse0 -I   hotkey sequence, first click at once\n"
+            "  intool.pyw -n -k ctrl+k+c -a mouse0              hotkey of three keys held together\n"
+            "  intool.pyw -n -a mouse0 -B f7=space -B \"f6=a, wait:1s, b\"   more hotkeys for other actions\n"
             "  intool.pyw -R --save                             record until F10, keep it as the action\n"
             "  intool.pyw -n -s -r 1 -I                         play the saved action once\n"
             "  intool.pyw -a e -d 250ms -l                      open the GUI prefilled, listener on\n"
@@ -3512,14 +3711,13 @@ def build_parser():
     job.add_argument("-v", "--value", type=number(1), metavar="N",
                      help="scroll amount, 120 = one wheel notch")
     job.add_argument("-k", "--hotkey", type=hotkey, metavar="HOTKEY",
-                     help="hotkey of the selected key state: f6, ctrl+f6, up; "
-                          "comma-separated chords form a sequence")
-    job.add_argument("--hotkey-press", type=hotkey, metavar="HOTKEY", help="hotkey of the press state")
-    job.add_argument("--hotkey-release", type=hotkey, metavar="HOTKEY", help="hotkey of the release state")
-    job.add_argument("--hotkey-press-release", type=hotkey, metavar="HOTKEY",
-                     help="hotkey of the press & release state")
-    job.add_argument("-I", "--immediate", action="store_true",
-                     help="perform the action right when the job starts instead of after the first delay")
+                     help="hotkey that starts and stops the job: f6, ctrl+f6, up; "
+                          "join keys with + to press them together")
+    job.add_argument("-B", "--bind", action="append", type=binding, metavar="HOTKEY=ACTION",
+                     help="another hotkey for another action (repeatable): f7=space")
+    job.add_argument("-I", "--immediate", action=argparse.BooleanOptionalAction, default=None,
+                     help="perform the action right when the job starts instead of after the first delay "
+                          "(default: on)")
     job.add_argument("-c", "--clicks", type=number(1), metavar="N", help="actions per trigger")
     job.add_argument("-r", "--repeat", type=number(0), metavar="N", help="number of cycles (0 = forever)")
 
@@ -3567,24 +3765,16 @@ def collect_options(args, data):
             fields[key] = str(value)
     if args.interval is not None:
         fields["interval"] = f"{args.interval * 1000:g}ms"
-    fields["immediate"] = args.immediate or to_bool(data.get("immediate", False))
+    fields["immediate"] = to_bool(data.get("immediate", True)) if args.immediate is None else args.immediate
     given = {option.key: getattr(args, option.key) for option in OPTIONS}
     fields.update(valid_options({**data, **{key: value for key, value in given.items() if value is not None}}))
 
-    hotkeys = resolve_hotkeys(data, fields["state"])
-    overrides = {
-        "press": args.hotkey_press,
-        "release": args.hotkey_release,
-        "press & release": args.hotkey_press_release,
-    }
-    hotkeys.update({state: text for state, text in overrides.items() if text is not None})
-    if args.hotkey is not None:
-        hotkeys[fields["state"]] = args.hotkey
-    fields["hotkey"] = hotkeys[fields["state"]]
+    fields["hotkey"] = args.hotkey or resolve_hotkey(data, fields["state"])
+    fields["bindings"] = args.bind if args.bind is not None else valid_bindings(data.get("bindings"))
 
     backend = args.backend or pick(data.get("backend", "Auto"), LinuxInput.MODES, "Auto")
     theme = args.theme or pick(data.get("theme", "Auto"), ["Auto"] + list(THEMES), "Auto")
-    return fields, hotkeys, backend, theme
+    return fields, backend, theme
 
 
 def main(argv=None):
@@ -3606,12 +3796,12 @@ def main(argv=None):
         except OSError:
             pass
     data = read_config(config_path)
-    fields, hotkeys, backend, theme = collect_options(args, data)
-    stored = {key: value for key, value in fields.items() if key != "hotkey"}
+    fields, backend, theme = collect_options(args, data)
+    stored = dict(fields)
 
     if args.save:
-        saved = {**data, **stored, "backend": backend, "theme": theme, "hotkeys": hotkeys}
-        saved.pop("hotkey", None)
+        saved = {**data, **stored, "backend": backend, "theme": theme}
+        saved.pop("hotkeys", None)
         if not write_config(config_path, saved):
             print(f"{parser.prog}: warning: cannot write {config_path}", file=sys.stderr)
         try:
@@ -3631,7 +3821,7 @@ def main(argv=None):
             print(f"{parser.prog}: GUI unavailable ({exc}); running in terminal mode", file=sys.stderr)
             args.nogui = True
         else:
-            overrides = {**stored, "backend": backend, "theme": theme, "hotkeys": hotkeys}
+            overrides = {**stored, "backend": backend, "theme": theme}
             App(
                 root, config_path, overrides, auto_listen=args.listen, auto_start=args.start,
                 start_minimized=args.minimized,
