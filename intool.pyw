@@ -166,7 +166,7 @@ CODE_NAMES.update(
 
 DEFAULTS = {
     "h": "0", "m": "0", "s": "1", "ms": "0",
-    "clicks": "1", "repeat": "0", "action": "mouse0",
+    "clicks": "1", "repeat": "1", "action": "mouse0",
 }
 
 ALIASES = {"helper": "root helper", "root": "root helper", "both": "press & release", "tap": "press & release"}
@@ -2613,7 +2613,7 @@ class App:
         self.device_selection = pick(data.get("device"), DEVICES, OPTION_DEFAULTS["device"])
         self.interval_var = tk.StringVar(value=str(data.get("interval", OPTION_DEFAULTS["interval"])))
         self.value_var = tk.StringVar(value=str(data.get("value", OPTION_DEFAULTS["value"])))
-        self.immediate_var = tk.BooleanVar(value=to_bool(data.get("immediate", True)))
+        self.immediate_var = tk.BooleanVar(value=to_bool(data.get("immediate", False)))
         self.bindings = valid_bindings(data.get("bindings"))
         self.active_binding = 0
         self._counter = None
@@ -3549,7 +3549,7 @@ class App:
         self.device_selection = OPTION_DEFAULTS["device"]
         self.interval_var.set(OPTION_DEFAULTS["interval"])
         self.value_var.set(OPTION_DEFAULTS["value"])
-        self.immediate_var.set(True)
+        self.immediate_var.set(False)
         self.bindings = []
         for option in OPTIONS:
             self.option_vars[option.key].set(option.clean(None))
@@ -3964,7 +3964,7 @@ def collect_options(args, data):
             fields[key] = str(value)
     if args.interval is not None:
         fields["interval"] = f"{args.interval * 1000:g}ms"
-    fields["immediate"] = to_bool(data.get("immediate", True)) if args.immediate is None else args.immediate
+    fields["immediate"] = to_bool(data.get("immediate", False)) if args.immediate is None else args.immediate
     given = {option.key: getattr(args, option.key) for option in OPTIONS}
     fields.update(valid_options({**data, **{key: value for key, value in given.items() if value is not None}}))
 

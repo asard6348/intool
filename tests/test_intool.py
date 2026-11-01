@@ -479,7 +479,7 @@ class CommandLineTests(unittest.TestCase):
         stored, *_ = intool.collect_options(self.parser.parse_args([]), {"immediate": False})
         self.assertFalse(stored["immediate"])
         default, *_ = intool.collect_options(self.parser.parse_args([]), {})
-        self.assertTrue(default["immediate"])
+        self.assertFalse(default["immediate"])
 
     def test_action_and_hotkey_accept_sequences(self):
         args = self.parser.parse_args(["-a", "pos:1:2, mouse0", "-k", "ctrl+k+c"])
@@ -2456,13 +2456,15 @@ class GuiSmokeTests(unittest.TestCase):
         self.app.immediate_var.set(False)
         self.app.save_config()
         self.assertFalse(intool.read_config(self.config)["immediate"])
+        self.app.immediate_var.set(True)
         self.app.delete_config()
-        self.assertTrue(self.app.immediate_var.get())
+        self.assertFalse(self.app.immediate_var.get())
 
-    def test_new_installs_use_one_second_and_act_immediately(self):
+    def test_new_installs_wait_one_second_and_run_one_cycle(self):
         self.assertEqual(self.app.entries["s"].get(), "1")
         self.assertEqual(self.app.entries["h"].get(), "0")
-        self.assertTrue(self.app.immediate_var.get())
+        self.assertEqual(self.app.entries["repeat"].get(), "1")
+        self.assertFalse(self.app.immediate_var.get())
         self.assertEqual(self.app.entries["hotkey"].get(), intool.DEFAULT_HOTKEY)
 
     def test_unmap_hides_to_the_tray_only_when_enabled_and_available(self):

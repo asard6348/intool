@@ -63,9 +63,9 @@ Windows may show a SmartScreen warning for unsigned executables; choose **More i
 
 ### GUI
 
-Run the executable without arguments. Fill in the delay (1 second by default), actions per trigger, repeat cycles, action, and hotkey, then press **Start**, or **Start Listening** to start and stop the job with the hotkey. While a job runs the window counts down to the next trigger. The gear next to **Start Recording** opens the recording settings.
+Run the executable without arguments. Fill in the delay (1 second by default), actions per trigger, repeat cycles (1 by default), action, and hotkey, then press **Start**, or **Start Listening** to start and stop the job with the hotkey. While a job runs the window counts down to the next trigger. The gear next to **Start Recording** opens the recording settings.
 
-**Start Recording** captures the keys, mouse buttons and pointer you use until you press **Stop Recording** (or the recording hotkey, **F10** by default, which also starts a recording while listening) and writes them into the Action field. To play a recording once, turn on **Act immediately on start** and set **Repeat cycles** to 1. Recording and listening share one input source and can run together; the job hotkey is ignored while recording. Recording is unavailable while a job runs, because injected input would be captured too. With **Record pointer** set to `path`, a recording that holds only pointer movement is kept as a path of `pos:` or `move:` steps.
+**Start Recording** captures the keys, mouse buttons and pointer you use until you press **Stop Recording** (or the recording hotkey, **F10** by default, which also starts a recording while listening) and writes them into the Action field. To play a recording once, turn on **Act immediately on start** (repeat cycles default to 1). Recording and listening share one input source and can run together; the job hotkey is ignored while recording. Recording is unavailable while a job runs, because injected input would be captured too. With **Record pointer** set to `path`, a recording that holds only pointer movement is kept as a path of `pos:` or `move:` steps.
 
 ### Action sequences
 
@@ -104,7 +104,7 @@ The gear button opens Settings:
 - **Interval**: hold time for press & release (default `100ms`)
   With uinput, libinput ignores a mouse button press that follows a release by less than about 25 ms and merges the two clicks into one long hold. Intool therefore keeps at least 30 ms between a release and the next press of the same button. For a fast clicker use a short Interval: `Delay 40ms` with `Interval 10ms` gives a 50 ms click period, while `Interval 100ms` makes the period at least 130 ms.
 - **Scroll value**: scroll amount, where `120` is one wheel notch
-- **Act immediately on start** (on by default): perform the action as soon as the job starts instead of waiting for the first delay
+- **Act immediately on start** (off by default): perform the action as soon as the job starts instead of waiting for the first delay
 - **Hotkey order**: `modifiers first` fires only when the modifiers are already held; `any order` also fires when a modifier is pressed last
 - **Relative movement** and **Screen size**: see Action sequences
 - **System** (button): minimizing to the tray, the daily schedule, and opening on system startup (see below)
