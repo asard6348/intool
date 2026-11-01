@@ -36,7 +36,7 @@ if IS_LINUX:
 
 APP_NAME = "Intool"
 APP_DIRNAME = "Intool"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 VIRTUAL_NAME = "Intool Virtual Device"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_FILE = "intool.desktop"
