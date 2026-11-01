@@ -48,7 +48,7 @@ RELEASE_GAP = 0.03
 EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
 REL_X, REL_Y, REL_HWHEEL, REL_WHEEL, REL_WHEEL_HI_RES = 0, 1, 6, 8, 11
 ABS_X, ABS_Y = 0, 1
-POINTER_DX, POINTER_DY = -1, -2
+POINTER_DX, POINTER_DY, PAD_DX, PAD_DY = -1, -2, -3, -4
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA = 0x110, 0x111, 0x112, 0x113, 0x114
 
 EVENT_FMT = "llHHi"
@@ -73,6 +73,7 @@ ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2F, 0x
 BTN_TOUCH, BTN_TOOL_FINGER = 0x14A, 0x145
 SYN_REPORT, SYN_DROPPED = 0, 3
 COUNTS_PER_MM = 1000 / 25.4
+TOUCHPAD_SLOWDOWN = 0.2968
 ASSUMED_PAD_MM = 100.0
 TAP_SECONDS = 0.2
 TAP_TRAVEL_MM = 2.0
@@ -358,6 +359,16 @@ def to_bool(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def parse_speed(text):
+    try:
+        value = float(str(text).strip())
+    except ValueError:
+        raise ValueError(f"invalid speed '{text}' (a number such as 1 or 0.6)") from None
+    if not math.isfinite(value) or not 0.05 <= value <= 20:
+        raise ValueError(f"invalid speed '{text}' (between 0.05 and 20)")
+    return value
+
+
 def parse_duration(text):
     s = (text or "").strip().lower().replace(" ", "")
     error = ValueError(f"invalid duration '{text}' (examples: 500ms, 2s, 1m30s, 0.5)")
@@ -531,6 +542,8 @@ OPTIONS = (
     Option("record_waits", "Record waits", True, "bool", group="recording"),
     Option("record_min_wait", "Minimum wait", "10ms", parse=parse_duration, group="recording"),
     Option("record_path_interval", "Path sample interval", "50ms", parse=parse_duration, group="recording"),
+    Option("record_touchpad_speed", "Touchpad speed (scales recorded touchpad movement)", "1",
+           parse=parse_speed, group="recording"),
     Option("record_trim_click", "Leave out the Stop Recording click", True, "bool", group="recording"),
     Option("record_drop_held", "Drop keys still held at the end", True, "bool", group="recording"),
     Option("minimize_to_tray", "Minimize to tray (needs the pystray and Pillow packages)", False, "bool",
@@ -1168,8 +1181,8 @@ class TouchpadTracker:
         if None in (finger["x"], finger["y"], finger["px"], finger["py"]):
             return []
         events = []
-        for index, (axis, now, before) in enumerate(((POINTER_DX, finger["x"], finger["px"]),
-                                                      (POINTER_DY, finger["y"], finger["py"]))):
+        for index, (axis, now, before) in enumerate(((PAD_DX, finger["x"], finger["px"]),
+                                                      (PAD_DY, finger["y"], finger["py"]))):
             counts = (now - before) * COUNTS_PER_MM / self.units_per_mm[index] + self.remainder[index]
             whole = int(counts)
             self.remainder[index] = counts - whole
@@ -1320,10 +1333,10 @@ class EvdevSource:
                 raw.append((sec, usec, fd, etype, code, value))
         raw.sort(key=lambda event: event[:2])
         events = []
-        moved = [0, 0]
+        moved = [0, 0, 0, 0]
 
         def flush_motion():
-            for index, axis in enumerate((POINTER_DX, POINTER_DY)):
+            for index, axis in enumerate((POINTER_DX, POINTER_DY, PAD_DX, PAD_DY)):
                 if moved[index]:
                     events.append((axis, moved[index]))
                 moved[index] = 0
@@ -1334,9 +1347,9 @@ class EvdevSource:
                 if etype == EV_KEY and code in TAP_BUTTONS.values():
                     pad.note_button()
                 for axis, amount in pad.feed(etype, code, value, sec + usec / 1e6):
-                    if axis in (POINTER_DX, POINTER_DY):
+                    if axis in (PAD_DX, PAD_DY):
                         if self.motion:
-                            moved[0 if axis == POINTER_DX else 1] += amount
+                            moved[2 if axis == PAD_DX else 3] += amount
                     else:
                         flush_motion()
                         events.append((axis, amount))
@@ -1693,13 +1706,14 @@ class RecordOptions:
     path_interval: float = 0.05
     trim_click: bool = True
     drop_held: bool = True
+    touchpad_speed: float = 1.0
 
     @classmethod
     def from_options(cls, options):
         return cls(
             options["record_pointer"], options["record_coordinates"], options["record_waits"],
             options["record_min_wait"], max(0.005, options["record_path_interval"]),
-            options["record_trim_click"], options["record_drop_held"],
+            options["record_trim_click"], options["record_drop_held"], options["record_touchpad_speed"],
         )
 
 
@@ -1718,6 +1732,7 @@ class Recorder:
         self.last_sample = None
         self.location = None
         self.pending = [0, 0]
+        self.pad_remainder = [0.0, 0.0]
         self.done = False
         self.tracking = self.options.pointer != "off"
         self.absolute = pointer is not None and self.options.coordinates != "relative"
@@ -1733,6 +1748,14 @@ class Recorder:
         with self.lock:
             if not self.wants_motion or self.done:
                 return
+            if code in (PAD_DX, PAD_DY):
+                index = 0 if code == PAD_DX else 1
+                scaled = value * TOUCHPAD_SLOWDOWN * self.options.touchpad_speed + self.pad_remainder[index]
+                value = int(scaled)
+                self.pad_remainder[index] = scaled - value
+                code = POINTER_DX if index == 0 else POINTER_DY
+                if not value:
+                    return
             if self.integrates:
                 self.pointer.add(code, value)
             else:
