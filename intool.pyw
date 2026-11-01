@@ -43,7 +43,7 @@ AUTOSTART_FILE = "intool.desktop"
 RESCAN_SECONDS = 3.0
 DRAIN_READS = 256
 SCROLL_NOTCH = 120
-MIN_CLICK = 0.02
+RELEASE_GAP = 0.03
 
 EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
 REL_X, REL_Y, REL_HWHEEL, REL_WHEEL, REL_WHEEL_HI_RES = 0, 1, 6, 8, 11
@@ -703,26 +703,30 @@ def x11_session():
 
 class Injector:
     screen = None
+    release_gap = 0.0
 
     def __init__(self):
         self.held = []
-        self.pressed_at = {}
+        self.released_at = {}
 
     def set_screen(self, size):
         self.screen = size
 
-    def _hold_long_enough(self, code):
-        started = self.pressed_at.pop(code, None)
-        if started is not None and time.monotonic() - started < MIN_CLICK:
+    def _wait_for_gap(self, code):
+        released = self.released_at.get(code)
+        if released is None:
+            return
+        remaining = self.release_gap - (time.monotonic() - released)
+        if remaining > 0:
             self.flush()
-            time.sleep(MIN_CLICK - (time.monotonic() - started))
+            time.sleep(remaining)
 
     def _press(self, code, down):
         if code in MOUSE_CODES:
             if down:
-                self.pressed_at[code] = time.monotonic()
+                self._wait_for_gap(code)
             else:
-                self._hold_long_enough(code)
+                self.released_at[code] = time.monotonic()
         self.key(code, down)
         self._track(code, down)
 
@@ -755,10 +759,10 @@ class Injector:
 
     def release_all(self):
         for code in reversed(self.held):
-            self._hold_long_enough(code)
             self.key(code, False)
+            if code in MOUSE_CODES:
+                self.released_at[code] = time.monotonic()
         self.held.clear()
-        self.pressed_at.clear()
         self.flush()
 
     def flush(self):
@@ -767,6 +771,7 @@ class Injector:
 
 class UInputDevice(Injector):
     label = "uinput"
+    release_gap = RELEASE_GAP
 
     def __init__(self):
         Injector.__init__(self)

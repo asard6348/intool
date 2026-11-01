@@ -874,40 +874,53 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(options["autostart_arguments"], [])
 
 
-class MouseReleaseTests(unittest.TestCase):
-    def test_a_mouse_button_is_held_long_enough_to_register(self):
-        injector = RecordingInjector()
-        sleeps = []
-        with mock.patch.object(intool.time, "sleep", sleeps.append):
-            injector.pulse(spec("up", [intool.BTN_LEFT]))
-            injector.pulse(spec("down", [intool.BTN_LEFT]))
-            injector.pulse(spec("up", [intool.BTN_LEFT]))
-        self.assertEqual([step for step in injector.steps if step[0] == "key"],
-                         [("key", intool.BTN_LEFT, False), ("key", intool.BTN_LEFT, True),
-                          ("key", intool.BTN_LEFT, False)])
-        self.assertEqual(len(sleeps), 1)
-        self.assertTrue(0 < sleeps[0] <= intool.MIN_CLICK)
+class GapInjector(RecordingInjector):
+    release_gap = 0.03
 
-    def test_a_slow_click_is_not_delayed_and_keys_are_never_delayed(self):
-        injector = RecordingInjector()
+
+class MouseReleaseTests(unittest.TestCase):
+    def test_a_press_right_after_a_release_waits_for_the_gap(self):
+        injector = GapInjector()
         sleeps = []
         with mock.patch.object(intool.time, "sleep", sleeps.append):
             injector.pulse(spec("down", [intool.BTN_LEFT]))
-            injector.pressed_at[intool.BTN_LEFT] -= 1
+            injector.pulse(spec("up", [intool.BTN_LEFT]))
+            injector.pulse(spec("down", [intool.BTN_LEFT]))
+        self.assertEqual(len(sleeps), 1)
+        self.assertTrue(0 < sleeps[0] <= injector.release_gap)
+
+    def test_no_wait_when_the_gap_has_passed_or_is_not_needed(self):
+        injector = GapInjector()
+        sleeps = []
+        with mock.patch.object(intool.time, "sleep", sleeps.append):
+            injector.pulse(spec("down", [intool.BTN_LEFT]))
+            injector.pulse(spec("up", [intool.BTN_LEFT]))
+            injector.released_at[intool.BTN_LEFT] -= 1
+            injector.pulse(spec("down", [intool.BTN_LEFT]))
             injector.pulse(spec("up", [intool.BTN_LEFT]))
             injector.pulse(spec("down", [intool.KEYS["a"]]))
             injector.pulse(spec("up", [intool.KEYS["a"]]))
+            injector.pulse(spec("down", [intool.KEYS["a"]]))
+        self.assertEqual(sleeps, [])
+        plain = RecordingInjector()
+        with mock.patch.object(intool.time, "sleep", sleeps.append):
+            for state in ("down", "up", "down"):
+                plain.pulse(spec(state, [intool.BTN_LEFT]))
         self.assertEqual(sleeps, [])
 
-    def test_release_all_lets_go_of_buttons_after_the_minimum_hold(self):
-        injector = RecordingInjector()
+    def test_release_all_records_the_release_time(self):
+        injector = GapInjector()
         sleeps = []
         with mock.patch.object(intool.time, "sleep", sleeps.append):
             injector.pulse(spec("down", [intool.BTN_LEFT]))
             injector.release_all()
-        self.assertEqual(injector.steps[-2:], [("key", intool.BTN_LEFT, False), ("flush",)])
-        self.assertEqual(injector.held, [])
+            self.assertEqual(injector.held, [])
+            injector.pulse(spec("down", [intool.BTN_LEFT]))
         self.assertEqual(len(sleeps), 1)
+
+    def test_only_uinput_enforces_the_gap(self):
+        self.assertEqual(intool.UInputDevice.release_gap, intool.RELEASE_GAP)
+        self.assertEqual(intool.Injector.release_gap, 0)
 
     def test_countdown_formatting(self):
         self.assertEqual(intool.format_countdown(0.04), "0.0s")

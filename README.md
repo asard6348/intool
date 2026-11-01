@@ -102,6 +102,7 @@ The gear button opens Settings:
 - **Key state**: press, release, or press & release
 - **Scroll device**: wheel, touchpad, or pinch
 - **Interval**: hold time for press & release (default `100ms`)
+  With uinput, libinput ignores a mouse button press that follows a release by less than about 25 ms and merges the two clicks into one long hold. Intool therefore keeps at least 30 ms between a release and the next press of the same button. For a fast clicker use a short Interval: `Delay 40ms` with `Interval 10ms` gives a 50 ms click period, while `Interval 100ms` makes the period at least 130 ms.
 - **Scroll value**: scroll amount, where `120` is one wheel notch
 - **Act immediately on start** (on by default): perform the action as soon as the job starts instead of waiting for the first delay
 - **Hotkey order**: `modifiers first` fires only when the modifiers are already held; `any order` also fires when a modifier is pressed last
