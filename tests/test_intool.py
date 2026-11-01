@@ -633,7 +633,7 @@ class RecorderTests(unittest.TestCase):
 
     def recorder(self, times, pointer=None):
         ticks = iter(times)
-        return intool.Recorder(pointer, clock=lambda: next(ticks))
+        return intool.Recorder(pointer, clock=lambda: next(ticks), options=intool.RecordOptions(pointer="at events"))
 
     def test_keys_are_recorded_with_waits_between_events(self):
         recorder = self.recorder([0.0, 0.08, 0.58, 0.66])
@@ -942,7 +942,7 @@ class MotionPointerTests(unittest.TestCase):
     def test_recorder_turns_estimated_motion_into_absolute_steps(self):
         pointer = intool.MotionPointer((100, 100), (800, 600))
         ticks = iter([0.0, 0.1])
-        recorder = intool.Recorder(pointer, clock=lambda: next(ticks))
+        recorder = intool.Recorder(pointer, clock=lambda: next(ticks), options=intool.RecordOptions(pointer="at events"))
         self.assertTrue(recorder.wants_motion)
         recorder.motion(intool.POINTER_DX, 25)
         recorder.motion(intool.POINTER_DY, -10)
@@ -952,12 +952,12 @@ class MotionPointerTests(unittest.TestCase):
 
     def test_relative_coordinates_ignore_the_estimator(self):
         pointer = intool.MotionPointer((10, 10), (800, 600))
-        recorder = intool.Recorder(pointer, options=intool.RecordOptions(coordinates="relative"))
+        recorder = intool.Recorder(pointer, options=intool.RecordOptions(pointer="at events", coordinates="relative"))
         recorder.motion(intool.POINTER_DX, 5)
         self.assertEqual(pointer.position(), (15, 10))
 
     def test_other_pointers_do_not_integrate_motion(self):
-        recorder = intool.Recorder(FakePointer())
+        recorder = intool.Recorder(FakePointer(), options=intool.RecordOptions(pointer="at events"))
         self.assertFalse(recorder.wants_motion)
 
 
@@ -1195,7 +1195,7 @@ class RecorderModeTests(unittest.TestCase):
 
     def recorder(self, times, device=None, **options):
         ticks = iter(times)
-        return intool.Recorder(device, clock=lambda: next(ticks), options=intool.RecordOptions(**options))
+        return intool.Recorder(device, clock=lambda: next(ticks), options=intool.RecordOptions(**{"pointer": "at events", **options}))
 
     def test_relative_coordinates_use_pointer_deltas(self):
         pointer = FakePointer()
@@ -1514,7 +1514,7 @@ class CommandPointerTests(unittest.TestCase):
         engine = EngineTests.FakeEngine()
         events = []
         engine.notify = lambda event, *args: events.append(event)
-        engine.configure({"pointer_command": "intool-no-such-program"})
+        engine.configure({"pointer_command": "intool-no-such-program", "record_pointer": "at events"})
         self.assertFalse(engine.start_recording())
         self.assertIn("error", events)
         self.assertFalse(engine.recording)
@@ -1684,13 +1684,13 @@ class TouchpadTrackerTests(unittest.TestCase):
     def test_recorder_scales_touchpad_motion_with_the_speed_option(self):
         for speed, expected in ((1.0, int(1000 * intool.TOUCHPAD_SLOWDOWN)), (0.5, int(500 * intool.TOUCHPAD_SLOWDOWN))):
             with self.subTest(speed=speed):
-                options = intool.RecordOptions(touchpad_speed=speed)
+                options = intool.RecordOptions(pointer="at events", touchpad_speed=speed)
                 recorder = intool.Recorder(None, options=options)
                 recorder.motion(intool.PAD_DX, 1000)
                 self.assertEqual(recorder.pending, [expected, 0])
 
     def test_fast_strokes_get_extra_gain(self):
-        options = intool.RecordOptions(touchpad_acceleration=2.0)
+        options = intool.RecordOptions(pointer="at events", touchpad_acceleration=2.0)
         pending = {}
         for speed in (10, intool.PAD_SLOW_MM_S, 180, intool.PAD_FAST_MM_S, 5000):
             recorder = intool.Recorder(None, options=options)
@@ -1705,7 +1705,7 @@ class TouchpadTrackerTests(unittest.TestCase):
         self.assertEqual(pending[5000], pending[int(intool.PAD_FAST_MM_S)])
 
     def test_scaling_carries_fractions_between_events(self):
-        recorder = intool.Recorder(None, options=intool.RecordOptions(touchpad_speed=1.0))
+        recorder = intool.Recorder(None, options=intool.RecordOptions(pointer="at events", touchpad_speed=1.0))
         for _ in range(1000):
             recorder.motion(intool.PAD_DY, 1)
         self.assertEqual(recorder.pending, [0, int(1000 * intool.TOUCHPAD_SLOWDOWN)])
@@ -2061,6 +2061,7 @@ class EngineTests(unittest.TestCase):
 
     def test_auto_estimates_an_unreadable_pointer_from_the_screen_center(self):
         engine = self.FakeEngine()
+        engine.configure({"record_pointer": "at events"})
         engine._screen = (800, 600)
         warped = []
         engine._execute = warped.append
@@ -2116,7 +2117,7 @@ class EngineTests(unittest.TestCase):
         for reason in ("no screen size", "warp fails"):
             with self.subTest(reason=reason):
                 engine = self.FakeEngine()
-                engine.configure({"record_coordinates": "absolute"})
+                engine.configure({"record_coordinates": "absolute", "record_pointer": "at events"})
                 events = []
                 engine.notify = lambda event, *args: events.append(event)
                 if reason == "warp fails":
@@ -2236,6 +2237,7 @@ class EngineTests(unittest.TestCase):
 
     def test_motion_flag_follows_the_recording(self):
         engine = self.FakeEngine()
+        engine.configure({"record_pointer": "at events"})
         events = []
         engine.notify = lambda event, *args: events.append((event, args))
         a = intool.KEYS["a"]
@@ -2253,7 +2255,7 @@ class EngineTests(unittest.TestCase):
         engine = self.FakeEngine()
         events = []
         engine.notify = lambda event, *args: events.append(event)
-        engine.configure({"record_coordinates": "absolute"})
+        engine.configure({"record_coordinates": "absolute", "record_pointer": "at events"})
         with mock.patch.object(intool, "open_pointer", return_value=None):
             self.assertFalse(engine.start_recording())
         self.assertIn("error", events)

@@ -538,7 +538,7 @@ OPTIONS = (
     Option("pointer_command", "Pointer command (auto, or a command printing X Y)", "auto", parse=parse_command),
     Option("record_hotkey", "Recording hotkey (empty = none)", "f10",
            parse=parse_optional_hotkey, group="recording"),
-    Option("record_pointer", "Record pointer", POINTER_MODES[1], "choice", POINTER_MODES, group="recording"),
+    Option("record_pointer", "Record pointer", POINTER_MODES[0], "choice", POINTER_MODES, group="recording"),
     Option("record_coordinates", "Pointer coordinates", COORDINATES[0], "choice", COORDINATES,
            group="recording"),
     Option("record_waits", "Record waits", True, "bool", group="recording"),
@@ -1709,7 +1709,7 @@ class HotkeyMatcher:
 
 @dataclass(frozen=True)
 class RecordOptions:
-    pointer: str = "at events"
+    pointer: str = "off"
     coordinates: str = "auto"
     waits: bool = True
     min_wait: float = 0.01
