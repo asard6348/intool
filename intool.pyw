@@ -64,6 +64,19 @@ UI_DEV_CREATE = 0x5501
 UI_DEV_DESTROY = 0x5502
 EVIOCGNAME_256 = 0x81004506
 EVIOCGBIT_TYPES = 0x80044520
+EVIOCGBIT_KEYS = 0x80604521
+EVIOCGBIT_ABS = 0x80084523
+EVIOCGPROP = 0x80044509
+EVIOCGABS = 0x80184540
+INPUT_PROP_DIRECT = 0x02
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2F, 0x35, 0x36, 0x39
+BTN_TOUCH, BTN_TOOL_FINGER = 0x14A, 0x145
+SYN_REPORT, SYN_DROPPED = 0, 3
+COUNTS_PER_MM = 1000 / 25.4
+ASSUMED_PAD_MM = 100.0
+TAP_SECONDS = 0.2
+TAP_TRAVEL_MM = 2.0
+TAP_BUTTONS = {1: BTN_LEFT, 2: BTN_RIGHT, 3: BTN_MIDDLE}
 
 UINPUT_PATHS = ("/dev/uinput", "/dev/input/uinput", "/dev/misc/uinput")
 
@@ -1093,11 +1106,106 @@ class WindowsKeyPoller:
         pass
 
 
+class TouchpadTracker:
+    def __init__(self, units_per_mm, multitouch=True):
+        self.units_per_mm = units_per_mm
+        self.multitouch = multitouch
+        self.reset()
+
+    def reset(self):
+        self.slots = {}
+        self.slot = 0
+        self.remainder = [0.0, 0.0]
+        self.touch = None
+        self.button = False
+
+    def note_button(self):
+        if self.touch is not None:
+            self.button = True
+
+    def _finger(self, slot):
+        return self.slots.setdefault(slot, {"x": None, "y": None, "px": None, "py": None, "ox": None, "oy": None})
+
+    def feed(self, etype, code, value, now):
+        if etype == EV_ABS:
+            self._absolute(code, value)
+        elif etype == EV_KEY and code == BTN_TOUCH and not self.multitouch:
+            if value:
+                self._finger(0)
+            else:
+                self.slots.pop(0, None)
+        elif etype == EV_SYN:
+            if code == SYN_DROPPED:
+                self.reset()
+            elif code == SYN_REPORT:
+                return self._sync(now)
+        return []
+
+    def _absolute(self, code, value):
+        if code == ABS_MT_SLOT:
+            self.slot = value
+        elif code == ABS_MT_TRACKING_ID:
+            if value < 0:
+                self.slots.pop(self.slot, None)
+            else:
+                self.slots.pop(self.slot, None)
+                self._finger(self.slot)
+        elif code in (ABS_MT_POSITION_X, ABS_MT_POSITION_Y) and self.multitouch:
+            self._finger(self.slot)["x" if code == ABS_MT_POSITION_X else "y"] = value
+        elif code in (ABS_X, ABS_Y) and not self.multitouch and 0 in self.slots:
+            self.slots[0]["x" if code == ABS_X else "y"] = value
+
+    def _travel(self, finger):
+        if finger["x"] is None or finger["y"] is None:
+            return 0.0
+        if finger["ox"] is None:
+            finger["ox"], finger["oy"] = finger["x"], finger["y"]
+        return max(abs(finger["x"] - finger["ox"]) / self.units_per_mm[0],
+                   abs(finger["y"] - finger["oy"]) / self.units_per_mm[1])
+
+    def _motion(self):
+        finger = next(iter(self.slots.values()))
+        if None in (finger["x"], finger["y"], finger["px"], finger["py"]):
+            return []
+        events = []
+        for index, (axis, now, before) in enumerate(((POINTER_DX, finger["x"], finger["px"]),
+                                                      (POINTER_DY, finger["y"], finger["py"]))):
+            counts = (now - before) * COUNTS_PER_MM / self.units_per_mm[index] + self.remainder[index]
+            whole = int(counts)
+            self.remainder[index] = counts - whole
+            if whole:
+                events.append((axis, whole))
+        return events
+
+    def _sync(self, now):
+        events = []
+        count = len(self.slots)
+        if count and self.touch is None:
+            self.touch = {"start": now, "fingers": 0, "travel": 0.0}
+        if self.touch is not None:
+            self.touch["fingers"] = max(self.touch["fingers"], count)
+            for finger in self.slots.values():
+                self.touch["travel"] = max(self.touch["travel"], self._travel(finger))
+        if count == 1:
+            events = self._motion()
+        for finger in self.slots.values():
+            finger["px"], finger["py"] = finger["x"], finger["y"]
+        if count == 0 and self.touch is not None:
+            touch, self.touch = self.touch, None
+            button, self.button = self.button, False
+            if (not button and now - touch["start"] <= TAP_SECONDS and touch["travel"] <= TAP_TRAVEL_MM
+                    and touch["fingers"] in TAP_BUTTONS):
+                code = TAP_BUTTONS[touch["fingers"]]
+                events += [(code, 1), (code, 0)]
+        return events
+
+
 class EvdevSource:
     label = "evdev"
 
     def __init__(self):
         self._fds = {}
+        self._pads = {}
         self._next_scan = 0.0
         self.motion = False
         self._scan()
@@ -1107,7 +1215,33 @@ class EvdevSource:
             )
 
     @staticmethod
-    def _accept(fd):
+    def _bit(buf, index):
+        return index >> 3 < len(buf) and bool(buf[index >> 3] & (1 << (index & 7)))
+
+    @classmethod
+    def _touchpad(cls, fd):
+        try:
+            keys = bytearray(96)
+            fcntl.ioctl(fd, EVIOCGBIT_KEYS, keys)
+            axes = bytearray(8)
+            fcntl.ioctl(fd, EVIOCGBIT_ABS, axes)
+            props = bytearray(4)
+            fcntl.ioctl(fd, EVIOCGPROP, props)
+            multitouch = cls._bit(axes, ABS_MT_POSITION_X) and cls._bit(axes, ABS_MT_POSITION_Y)
+            single = cls._bit(axes, ABS_X) and cls._bit(axes, ABS_Y)
+            if props[0] & INPUT_PROP_DIRECT or not cls._bit(keys, BTN_TOOL_FINGER) or not (multitouch or single):
+                return None
+            resolution = []
+            for axis in ((ABS_MT_POSITION_X, ABS_MT_POSITION_Y) if multitouch else (ABS_X, ABS_Y)):
+                info = bytearray(24)
+                fcntl.ioctl(fd, EVIOCGABS + axis, info)
+                _, low, high, _, _, units = struct.unpack("6i", info)
+                resolution.append(float(units) if units > 0 else max(high - low, 1) / ASSUMED_PAD_MM)
+            return TouchpadTracker(tuple(resolution), multitouch)
+        except OSError:
+            return None
+
+    def _accept(self, fd):
         try:
             buf = bytearray(256)
             fcntl.ioctl(fd, EVIOCGNAME_256, buf)
@@ -1115,9 +1249,13 @@ class EvdevSource:
                 return False
             caps = bytearray(4)
             fcntl.ioctl(fd, EVIOCGBIT_TYPES, caps)
-            return bool(caps[0] & (1 << EV_KEY))
         except OSError:
             return False
+        pad = self._touchpad(fd)
+        if pad is not None:
+            self._pads[fd] = pad
+            return True
+        return bool(caps[0] & (1 << EV_KEY))
 
     def _scan(self):
         self._next_scan = time.monotonic() + RESCAN_SECONDS
@@ -1132,10 +1270,12 @@ class EvdevSource:
             if self._accept(fd):
                 self._fds[fd] = path
             else:
+                self._pads.pop(fd, None)
                 os.close(fd)
 
     def _drop(self, fd):
         self._fds.pop(fd, None)
+        self._pads.pop(fd, None)
         try:
             os.close(fd)
         except OSError:
@@ -1177,7 +1317,7 @@ class EvdevSource:
                 continue
             for offset in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
                 sec, usec, etype, code, value = struct.unpack_from(EVENT_FMT, data, offset)
-                raw.append((sec, usec, etype, code, value))
+                raw.append((sec, usec, fd, etype, code, value))
         raw.sort(key=lambda event: event[:2])
         events = []
         moved = [0, 0]
@@ -1188,7 +1328,18 @@ class EvdevSource:
                     events.append((axis, moved[index]))
                 moved[index] = 0
 
-        for _, _, etype, code, value in raw:
+        for sec, usec, fd, etype, code, value in raw:
+            pad = self._pads.get(fd)
+            if pad is not None:
+                if etype == EV_KEY and code in TAP_BUTTONS.values():
+                    pad.note_button()
+                for axis, amount in pad.feed(etype, code, value, sec + usec / 1e6):
+                    if axis in (POINTER_DX, POINTER_DY):
+                        if self.motion:
+                            moved[0 if axis == POINTER_DX else 1] += amount
+                    else:
+                        flush_motion()
+                        events.append((axis, amount))
             if etype == EV_KEY and value in (0, 1):
                 flush_motion()
                 events.append((code, value))

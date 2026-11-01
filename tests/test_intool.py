@@ -1526,6 +1526,7 @@ class EvdevMotionTests(unittest.TestCase):
         read, write = os.pipe()
         source = intool.EvdevSource.__new__(intool.EvdevSource)
         source._fds = {read: "pipe"}
+        source._pads = {}
         source._next_scan = float("inf")
         source.motion = False
         self.addCleanup(os.close, write)
@@ -1586,6 +1587,155 @@ class EvdevMotionTests(unittest.TestCase):
         source.set_motion(True)
         os.write(write, self.packet((intool.EV_REL, intool.REL_X, 4), (intool.EV_REL, intool.REL_X, -4)))
         self.assertEqual(source.poll(0.1), [])
+
+
+class TouchpadTrackerTests(unittest.TestCase):
+    MT = (intool.EV_ABS, intool.ABS_MT_TRACKING_ID)
+
+    def tracker(self, per_mm=(10.0, 10.0)):
+        return intool.TouchpadTracker(per_mm)
+
+    @staticmethod
+    def frame(tracker, t, *events):
+        out = []
+        for etype, code, value in events:
+            out += tracker.feed(etype, code, value, t)
+        return out + tracker.feed(intool.EV_SYN, intool.SYN_REPORT, 0, t)
+
+    def touch(self, tracker, t, slot, ident, x, y):
+        return self.frame(tracker, t, (intool.EV_ABS, intool.ABS_MT_SLOT, slot),
+                          (intool.EV_ABS, intool.ABS_MT_TRACKING_ID, ident),
+                          (intool.EV_ABS, intool.ABS_MT_POSITION_X, x),
+                          (intool.EV_ABS, intool.ABS_MT_POSITION_Y, y))
+
+    def move(self, tracker, t, slot, x, y):
+        return self.frame(tracker, t, (intool.EV_ABS, intool.ABS_MT_SLOT, slot),
+                          (intool.EV_ABS, intool.ABS_MT_POSITION_X, x),
+                          (intool.EV_ABS, intool.ABS_MT_POSITION_Y, y))
+
+    def lift(self, tracker, t, slot):
+        return self.frame(tracker, t, (intool.EV_ABS, intool.ABS_MT_SLOT, slot),
+                          (intool.EV_ABS, intool.ABS_MT_TRACKING_ID, -1))
+
+    def test_one_finger_moves_the_pointer_in_normalised_counts(self):
+        tracker = self.tracker()
+        self.assertEqual(self.touch(tracker, 0, 0, 1, 100, 100), [])
+        out = self.move(tracker, 0.01, 0, 110, 95)
+        counts = intool.COUNTS_PER_MM
+        self.assertEqual(out, [(intool.POINTER_DX, int(counts)), (intool.POINTER_DY, int(-0.5 * counts))])
+
+    def test_fractions_are_carried_over(self):
+        tracker = self.tracker((1000.0, 1000.0))
+        self.touch(tracker, 0, 0, 1, 0, 0)
+        total = 0
+        for step in range(1, 101):
+            for axis, amount in self.move(tracker, step * 0.001, 0, step, 0):
+                total += amount
+        self.assertEqual(total, int(100 * intool.COUNTS_PER_MM / 1000))
+
+    def test_two_fingers_scroll_instead_of_moving(self):
+        tracker = self.tracker()
+        self.touch(tracker, 0, 0, 1, 100, 100)
+        self.touch(tracker, 0.01, 1, 2, 200, 100)
+        self.assertEqual(self.move(tracker, 0.02, 0, 150, 150), [])
+        self.lift(tracker, 0.03, 1)
+        self.assertEqual(self.move(tracker, 0.04, 0, 150, 150), [])
+        self.assertTrue(self.move(tracker, 0.05, 0, 160, 150))
+
+    def test_a_short_still_touch_is_a_left_tap(self):
+        tracker = self.tracker()
+        self.touch(tracker, 0, 0, 1, 100, 100)
+        self.assertEqual(self.lift(tracker, 0.1, 0), [(intool.BTN_LEFT, 1), (intool.BTN_LEFT, 0)])
+
+    def test_two_and_three_finger_taps_are_right_and_middle_clicks(self):
+        for fingers, button in ((2, intool.BTN_RIGHT), (3, intool.BTN_MIDDLE)):
+            with self.subTest(fingers=fingers):
+                tracker = self.tracker()
+                for slot in range(fingers):
+                    self.touch(tracker, 0, slot, slot + 1, 100 + slot * 300, 100)
+                out = []
+                for slot in range(fingers):
+                    out += self.lift(tracker, 0.1, slot)
+                self.assertEqual(out, [(button, 1), (button, 0)])
+
+    def test_slow_moving_or_clicked_touches_are_not_taps(self):
+        tracker = self.tracker()
+        self.touch(tracker, 0, 0, 1, 100, 100)
+        self.assertEqual(self.lift(tracker, 0.5, 0), [])
+        self.touch(tracker, 1, 0, 2, 100, 100)
+        self.move(tracker, 1.05, 0, 200, 100)
+        self.assertEqual(self.lift(tracker, 1.1, 0), [])
+        self.touch(tracker, 2, 0, 3, 100, 100)
+        tracker.note_button()
+        self.assertEqual(self.lift(tracker, 2.1, 0), [])
+        self.touch(tracker, 3, 0, 4, 100, 100)
+        self.assertEqual(self.lift(tracker, 3.1, 0), [(intool.BTN_LEFT, 1), (intool.BTN_LEFT, 0)])
+
+    def test_single_touch_devices_use_btn_touch_and_abs_xy(self):
+        tracker = intool.TouchpadTracker((10.0, 10.0), multitouch=False)
+        self.frame(tracker, 0, (intool.EV_KEY, intool.BTN_TOUCH, 1),
+                   (intool.EV_ABS, intool.ABS_X, 50), (intool.EV_ABS, intool.ABS_Y, 50))
+        out = self.frame(tracker, 0.01, (intool.EV_ABS, intool.ABS_X, 60))
+        self.assertEqual(out, [(intool.POINTER_DX, int(intool.COUNTS_PER_MM))])
+        self.assertEqual(self.frame(tracker, 0.5, (intool.EV_KEY, intool.BTN_TOUCH, 0)), [])
+
+    def test_dropped_events_reset_the_state(self):
+        tracker = self.tracker()
+        self.touch(tracker, 0, 0, 1, 100, 100)
+        tracker.feed(intool.EV_SYN, intool.SYN_DROPPED, 0, 0.1)
+        self.assertEqual(tracker.slots, {})
+
+
+@unittest.skipUnless(intool.IS_LINUX, "evdev is Linux only")
+class EvdevTouchpadTests(unittest.TestCase):
+    source = EvdevMotionTests.source
+    stamped = staticmethod(EvdevMotionTests.stamped)
+
+    def pad_source(self):
+        source, write = self.source()
+        fd = next(iter(source._fds))
+        source._pads[fd] = intool.TouchpadTracker((10.0, 10.0))
+        source.set_motion(True)
+        return source, write
+
+    def frames(self, *frames):
+        events = []
+        for t, items in frames:
+            sec, usec = int(t), int(t % 1 * 1e6)
+            events += [(sec, usec, etype, code, value) for etype, code, value in items]
+            events.append((sec, usec, intool.EV_SYN, intool.SYN_REPORT, 0))
+        return self.stamped(*events)
+
+    @staticmethod
+    def finger(ident, x, y):
+        return [(intool.EV_ABS, intool.ABS_MT_SLOT, 0), (intool.EV_ABS, intool.ABS_MT_TRACKING_ID, ident),
+                (intool.EV_ABS, intool.ABS_MT_POSITION_X, x), (intool.EV_ABS, intool.ABS_MT_POSITION_Y, y)]
+
+    def test_finger_motion_is_reported_as_pointer_motion(self):
+        source, write = self.pad_source()
+        os.write(write, self.frames(
+            (1.0, self.finger(1, 100, 100)),
+            (1.01, [(intool.EV_ABS, intool.ABS_MT_POSITION_X, 120)]),
+        ))
+        self.assertEqual(source.poll(0.1), [(intool.POINTER_DX, int(2 * intool.COUNTS_PER_MM))])
+
+    def test_taps_are_clicks_even_when_motion_is_off(self):
+        source, write = self.pad_source()
+        source.set_motion(False)
+        os.write(write, self.frames(
+            (1.0, self.finger(1, 100, 100)),
+            (1.1, [(intool.EV_ABS, intool.ABS_MT_TRACKING_ID, -1)]),
+        ))
+        self.assertEqual(source.poll(0.1), [(intool.BTN_LEFT, 1), (intool.BTN_LEFT, 0)])
+
+    def test_a_physical_click_is_not_doubled_by_a_tap(self):
+        source, write = self.pad_source()
+        os.write(write, self.frames(
+            (1.0, self.finger(1, 100, 100)),
+            (1.05, [(intool.EV_KEY, intool.BTN_LEFT, 1)]),
+            (1.1, [(intool.EV_KEY, intool.BTN_LEFT, 0), (intool.EV_ABS, intool.ABS_MT_TRACKING_ID, -1)]),
+        ))
+        self.assertEqual(source.poll(0.1), [(intool.BTN_LEFT, 1), (intool.BTN_LEFT, 0)])
 
 
 class HelperProtocolTests(unittest.TestCase):
