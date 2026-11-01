@@ -1622,7 +1622,9 @@ class TouchpadTrackerTests(unittest.TestCase):
         self.assertEqual(self.touch(tracker, 0, 0, 1, 100, 100), [])
         out = self.move(tracker, 0.01, 0, 110, 95)
         counts = intool.COUNTS_PER_MM
-        self.assertEqual(out, [(intool.PAD_DX, int(counts)), (intool.PAD_DY, int(-0.5 * counts))])
+        self.assertEqual(out[0][0], intool.PAD_SPEED)
+        self.assertAlmostEqual(out[0][1], 111, delta=1)
+        self.assertEqual(out[1:], [(intool.PAD_DX, int(counts)), (intool.PAD_DY, int(-0.5 * counts))])
 
     def test_fractions_are_carried_over(self):
         tracker = self.tracker((1000.0, 1000.0))
@@ -1676,7 +1678,7 @@ class TouchpadTrackerTests(unittest.TestCase):
         self.frame(tracker, 0, (intool.EV_KEY, intool.BTN_TOUCH, 1),
                    (intool.EV_ABS, intool.ABS_X, 50), (intool.EV_ABS, intool.ABS_Y, 50))
         out = self.frame(tracker, 0.01, (intool.EV_ABS, intool.ABS_X, 60))
-        self.assertEqual(out, [(intool.PAD_DX, int(intool.COUNTS_PER_MM))])
+        self.assertEqual(out[1:], [(intool.PAD_DX, int(intool.COUNTS_PER_MM))])
         self.assertEqual(self.frame(tracker, 0.5, (intool.EV_KEY, intool.BTN_TOUCH, 0)), [])
 
     def test_recorder_scales_touchpad_motion_with_the_speed_option(self):
@@ -1686,6 +1688,21 @@ class TouchpadTrackerTests(unittest.TestCase):
                 recorder = intool.Recorder(None, options=options)
                 recorder.motion(intool.PAD_DX, 1000)
                 self.assertEqual(recorder.pending, [expected, 0])
+
+    def test_fast_strokes_get_extra_gain(self):
+        options = intool.RecordOptions(touchpad_acceleration=2.0)
+        pending = {}
+        for speed in (10, intool.PAD_SLOW_MM_S, 180, intool.PAD_FAST_MM_S, 5000):
+            recorder = intool.Recorder(None, options=options)
+            recorder.motion(intool.PAD_SPEED, speed)
+            recorder.motion(intool.PAD_DX, 1000)
+            pending[speed] = recorder.pending[0]
+        base = int(1000 * intool.TOUCHPAD_SLOWDOWN)
+        self.assertEqual(pending[10], base)
+        self.assertEqual(pending[int(intool.PAD_SLOW_MM_S)], base)
+        self.assertEqual(pending[180], int(1000 * intool.TOUCHPAD_SLOWDOWN * 1.5))
+        self.assertEqual(pending[int(intool.PAD_FAST_MM_S)], int(1000 * intool.TOUCHPAD_SLOWDOWN * 2))
+        self.assertEqual(pending[5000], pending[int(intool.PAD_FAST_MM_S)])
 
     def test_scaling_carries_fractions_between_events(self):
         recorder = intool.Recorder(None, options=intool.RecordOptions(touchpad_speed=1.0))
@@ -1738,7 +1755,9 @@ class EvdevTouchpadTests(unittest.TestCase):
             (1.0, self.finger(1, 100, 100)),
             (1.01, [(intool.EV_ABS, intool.ABS_MT_POSITION_X, 120)]),
         ))
-        self.assertEqual(source.poll(0.1), [(intool.PAD_DX, int(2 * intool.COUNTS_PER_MM))])
+        events = source.poll(0.1)
+        self.assertEqual([code for code, _ in events], [intool.PAD_SPEED, intool.PAD_DX])
+        self.assertEqual(events[1], (intool.PAD_DX, int(2 * intool.COUNTS_PER_MM)))
 
     def test_taps_are_clicks_even_when_motion_is_off(self):
         source, write = self.pad_source()
