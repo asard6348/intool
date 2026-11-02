@@ -60,6 +60,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -70,11 +73,40 @@ jobs:
         working-directory: release-files
         run: sha256sum * > SHA256SUMS.txt
 
+      - name: Read release notes from CHANGELOG.md
+        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Tag v1.2.3 -> the "## [1.2.3]" section of CHANGELOG.md, up to the
+          # next version heading or the link definitions at the end of the file.
+          version="${TAG#v}"
+          notes="${RUNNER_TEMP}/release-notes.md"
+          awk -v ver="$version" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > "$notes"
+          # Trim trailing blank lines.
+          sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$notes"
+
+          if [ -s "$notes" ]; then
+            echo "Using the [$version] section of CHANGELOG.md as the release description:"
+            cat "$notes"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "path=$notes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No [$version] section in CHANGELOG.md; falling back to generated release notes."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "path=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.found != 'true' }}
           fail_on_unmatched_files: true
           files: release-files/*
