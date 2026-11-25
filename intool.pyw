@@ -739,14 +739,14 @@ def set_titlebar_dark(window, dark):
         window.update_idletasks()
         user32 = ctypes.WinDLL("user32")
         dwmapi = ctypes.WinDLL("dwmapi")
-        user32.GetParent.argtypes = [wintypes.HWND]
-        user32.GetParent.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
         user32.SetWindowPos.argtypes = [
             wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT,
         ]
         dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
         handle = window.winfo_id()
-        frame = user32.GetParent(handle) or handle
+        frame = user32.GetAncestor(handle, 2) or handle
         value = ctypes.c_int(1 if dark else 0)
         for attribute in (20, 19):
             if dwmapi.DwmSetWindowAttribute(frame, attribute, ctypes.byref(value), ctypes.sizeof(value)) == 0:
@@ -2847,10 +2847,11 @@ class App:
         win.update_idletasks()
         pos = self._centered_over_root(win.winfo_reqwidth(), win.winfo_reqheight())
         win.geometry(self._fmt_pos(*pos))
-        set_titlebar_dark(win, self.is_dark)
         if self.root.state() != "normal" or not self.root.winfo_viewable():
             win.transient("")
         win.deiconify()
+        win.update_idletasks()
+        set_titlebar_dark(win, self.is_dark)
         win.lift()
         win.after(30, self._settle, win, pos, None, 10)
         if modal:
@@ -2860,6 +2861,8 @@ class App:
         if not self._alive(win):
             return
         if win.winfo_viewable():
+            if tries in (10, 5):
+                set_titlebar_dark(win, self.is_dark)
             size = (win.winfo_width(), win.winfo_height())
             current = (win.winfo_rootx(), win.winfo_rooty())
             if min(size) > 1 and current != seen:
@@ -2882,7 +2885,13 @@ class App:
         else:
             x = left + (right - left - width) // 2
             y = top + (bottom - top - height) // 2
-        return max(left, min(x, right - width)), max(top, min(y, bottom - height))
+        margin_top, margin_bottom = self._screen_margins()
+        y = min(y, bottom - margin_bottom - height)
+        return max(left, min(x, right - width)), max(top + margin_top, y)
+
+    def _screen_margins(self):
+        scale = max(self.root.winfo_fpixels("1i") / 96, 1)
+        return int(40 * scale), int(48 * scale)
 
     def _grab(self, win, tries=20):
         if not self._alive(win):

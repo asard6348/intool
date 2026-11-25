@@ -1209,7 +1209,7 @@ class TrayTests(unittest.TestCase):
 class NativeThemeTests(unittest.TestCase):
     def libraries(self, parent_result=7, dwm_results=(0,)):
         user32, dwmapi = mock.MagicMock(), mock.MagicMock()
-        user32.GetParent.return_value = parent_result
+        user32.GetAncestor.return_value = parent_result
         dwmapi.DwmSetWindowAttribute.side_effect = list(dwm_results)
         return user32, dwmapi, lambda name: {"user32": user32, "dwmapi": dwmapi}[name]
 
@@ -1244,7 +1244,7 @@ class NativeThemeTests(unittest.TestCase):
         with mock.patch.object(intool, "IS_WIN", True), \
                 mock.patch.object(intool.ctypes, "WinDLL", create=True, side_effect=loader):
             intool.set_titlebar_dark(window, True)
-        user32.GetParent.assert_called_once_with(42)
+        user32.GetAncestor.assert_called_once_with(42, 2)
         dwmapi.DwmSetWindowAttribute.assert_called_once()
         frame, attribute, value, size = dwmapi.DwmSetWindowAttribute.call_args.args
         self.assertEqual((frame, attribute, size), (7, 20, 4))
@@ -1265,7 +1265,7 @@ class NativeThemeTests(unittest.TestCase):
             intool.set_titlebar_dark(self.window(), True)
         self.assertEqual([call.args[1] for call in dwmapi.DwmSetWindowAttribute.call_args_list], [20, 19])
 
-    def test_the_window_itself_is_used_when_it_has_no_parent(self):
+    def test_the_window_itself_is_used_when_it_has_no_top_level_ancestor(self):
         user32, dwmapi, loader = self.libraries(parent_result=0)
         with mock.patch.object(intool, "IS_WIN", True), \
                 mock.patch.object(intool.ctypes, "WinDLL", create=True, side_effect=loader):
@@ -2634,6 +2634,27 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(win.winfo_rootx(), 0)
         self.assertGreaterEqual(win.winfo_rooty(), 0)
 
+    def test_dialog_title_bars_stay_on_screen_when_the_main_window_is_at_the_top(self):
+        self.root.geometry("+300+0")
+        self.root.update()
+        self.app.show_message("Info", "hello")
+        self.app.open_system()
+        self.pump()
+        top_margin = self.app._screen_margins()[0]
+        for win in self.open_windows():
+            with self.subTest(title=win.title()):
+                self.assertGreaterEqual(win.winfo_rooty(), top_margin)
+
+    def test_dialogs_stay_clear_of_the_bottom_edge_when_the_main_window_is_low(self):
+        height = self.root.winfo_vrootheight()
+        self.root.geometry(f"+300+{height - 120}")
+        self.root.update()
+        self.app.show_message("Info", "hello")
+        self.pump()
+        win = self.open_windows()[0]
+        bottom_margin = self.app._screen_margins()[1]
+        self.assertLessEqual(win.winfo_rooty() + win.winfo_height(), height - bottom_margin)
+
     def test_dialogs_centre_on_the_screen_when_the_main_window_is_hidden(self):
         self.root.withdraw()
         self.root.update()
@@ -2676,10 +2697,15 @@ class GuiSmokeTests(unittest.TestCase):
     def test_new_dialogs_get_the_current_titlebar_theme(self):
         self.app.theme_selection = "Light Slate"
         self.app.update_ui_theme()
-        with mock.patch.object(intool, "set_titlebar_dark") as titlebar:
+        seen = []
+        with mock.patch.object(intool, "set_titlebar_dark",
+                               side_effect=lambda win, dark: seen.append((bool(win.winfo_viewable()), dark))):
             self.app.show_message("Info", "hello")
             self.pump()
-        self.assertEqual([call.args[1] for call in titlebar.call_args_list], [False])
+        self.assertTrue(seen)
+        self.assertTrue(all(dark is False for _, dark in seen))
+        self.assertTrue(any(viewable for viewable, _ in seen))
+        self.assertTrue(seen[-1][0])
 
     def test_tray_menu_follows_the_theme(self):
         self.app.theme_selection = "Dark Slate"
