@@ -2848,6 +2848,8 @@ class App:
         pos = self._centered_over_root(win.winfo_reqwidth(), win.winfo_reqheight())
         win.geometry(self._fmt_pos(*pos))
         set_titlebar_dark(win, self.is_dark)
+        if self.root.state() != "normal" or not self.root.winfo_viewable():
+            win.transient("")
         win.deiconify()
         win.lift()
         win.after(30, self._settle, win, pos, None, 10)

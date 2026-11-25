@@ -2640,9 +2640,16 @@ class GuiSmokeTests(unittest.TestCase):
         self.app.show_message("Info", "hello")
         self.pump()
         win = self.open_windows()[0]
+        self.assertTrue(win.winfo_viewable())
+        self.assertEqual(win.wm_transient(), "")
         wx, wy = self.centre_of(win)
         self.assertLessEqual(abs(wx - self.root.winfo_vrootwidth() / 2), 3)
         self.assertLessEqual(abs(wy - self.root.winfo_vrootheight() / 2), 3)
+
+    def test_dialogs_stay_attached_to_a_visible_main_window(self):
+        self.app.show_message("Info", "hello")
+        self.pump()
+        self.assertEqual(str(self.open_windows()[0].wm_transient()), str(self.root))
 
     def test_modal_message_grabs_input_once_shown(self):
         self.app.show_message("Info", "hello")
