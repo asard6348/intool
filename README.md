@@ -98,7 +98,7 @@ A hotkey is one or more keys joined with `+`, for example `f8`, `ctrl+f6` or `ct
 
 The gear button opens Settings:
 
-- **Theme**: Auto, Dark Slate, Light Slate, or OLED Black
+- **Theme**: Auto, Dark Slate, Light Slate, or OLED Black. On Windows the title bars and the tray menu follow it too
 - **Key state**: press, release, or press & release
 - **Scroll device**: wheel, touchpad, or pinch
 - **Interval**: hold time for press & release (default `100ms`)
@@ -109,6 +109,8 @@ The gear button opens Settings:
 - **Relative movement** and **Screen size**: see Action sequences
 - **System** (button): minimizing to the tray, the daily schedule, and opening on system startup (see below)
 - **Extra Hotkeys** (button): more hotkeys, each running its own action (see below)
+
+Settings and every other window open centred over the main window.
 
 The gear next to **Start Recording** holds the recording settings: recording hotkey, pointer capture (`off`, `at events`, `path` with a sample interval), coordinates (`auto`, `absolute`, `relative`), recorded waits and their minimum, leaving out the Stop Recording click, and dropping keys still held at the end.
 - **Input backend** (Linux): Auto, uinput, xtest, or root helper

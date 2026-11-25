@@ -36,7 +36,7 @@ if IS_LINUX:
 
 APP_NAME = "Intool"
 APP_DIRNAME = "Intool"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 VIRTUAL_NAME = "Intool Virtual Device"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_FILE = "intool.desktop"
@@ -721,6 +721,53 @@ def detect_system_theme():
     except Exception:
         pass
     return "Dark Slate"
+
+
+def is_dark_color(color):
+    try:
+        red, green, blue = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    except (TypeError, ValueError):
+        return True
+    return 0.299 * red + 0.587 * green + 0.114 * blue < 128
+
+
+def set_titlebar_dark(window, dark):
+    if not IS_WIN:
+        return
+    try:
+        from ctypes import wintypes
+        window.update_idletasks()
+        user32 = ctypes.WinDLL("user32")
+        dwmapi = ctypes.WinDLL("dwmapi")
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetParent.restype = wintypes.HWND
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        ]
+        dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        handle = window.winfo_id()
+        frame = user32.GetParent(handle) or handle
+        value = ctypes.c_int(1 if dark else 0)
+        for attribute in (20, 19):
+            if dwmapi.DwmSetWindowAttribute(frame, attribute, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                break
+        user32.SetWindowPos(frame, None, 0, 0, 0, 0, 0x37)
+    except Exception:
+        pass
+
+
+def set_menu_dark(dark):
+    if not IS_WIN:
+        return
+    try:
+        uxtheme = ctypes.WinDLL("uxtheme")
+        set_preferred_app_mode = uxtheme[135]
+        set_preferred_app_mode.argtypes = [ctypes.c_int]
+        set_preferred_app_mode.restype = ctypes.c_int
+        set_preferred_app_mode(2 if dark else 3)
+        uxtheme[136]()
+    except Exception:
+        pass
 
 
 def x11_session():
@@ -2543,9 +2590,10 @@ def load_tray_backend():
 
 
 class Tray:
-    def __init__(self, on_show, on_toggle, on_quit, loader=load_tray_backend):
+    def __init__(self, on_show, on_toggle, on_quit, loader=load_tray_backend, dark=None):
         self.callbacks = (on_show, on_toggle, on_quit)
         self.loader = loader
+        self.dark = dark
         self.icon = None
 
     def show(self):
@@ -2555,6 +2603,8 @@ class Tray:
         if backend is None:
             return False
         pystray, image_module, draw_module = backend
+        if self.dark is not None:
+            set_menu_dark(self.dark())
         on_show, on_toggle, on_quit = self.callbacks
         picture = image_module.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw_module.Draw(picture).ellipse((6, 6, 58, 58), fill=(88, 166, 255, 255))
@@ -2632,6 +2682,7 @@ class App:
             lambda: self._soon(self.restore_window),
             lambda: self._soon(self.toggle_clicking),
             lambda: self._soon(self.on_closing),
+            dark=lambda: self.is_dark,
         )
 
         self.resolve_and_apply_theme()
@@ -2644,6 +2695,7 @@ class App:
         self.root.bind_all("<Button-1>", self._on_root_click, add="+")
         self.root.bind("<Unmap>", self._on_unmap, add="+")
         self._apply_saved_geometry()
+        self.apply_native_theme()
 
         if self.start_minimized:
             self.root.after(200, self.minimize)
@@ -2781,16 +2833,70 @@ class App:
 
     def _window(self, title, modal=True):
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.title(title)
         win.resizable(True, True)
         win.transient(self.root)
         self._themed_widget(win, "window")
-        if modal:
-            try:
-                win.grab_set()
-            except tk.TclError:
-                pass
+        win.after_idle(self._present, win, modal)
         return win
+
+    def _present(self, win, modal):
+        if not self._alive(win):
+            return
+        win.update_idletasks()
+        pos = self._centered_over_root(win.winfo_reqwidth(), win.winfo_reqheight())
+        win.geometry(self._fmt_pos(*pos))
+        set_titlebar_dark(win, self.is_dark)
+        win.deiconify()
+        win.lift()
+        win.after(30, self._settle, win, pos, None, 10)
+        if modal:
+            self._grab(win)
+
+    def _settle(self, win, pos, seen, tries):
+        if not self._alive(win):
+            return
+        if win.winfo_viewable():
+            size = (win.winfo_width(), win.winfo_height())
+            current = (win.winfo_rootx(), win.winfo_rooty())
+            if min(size) > 1 and current != seen:
+                target = self._centered_over_root(*size)
+                if target != current:
+                    pos = (pos[0] + target[0] - current[0], pos[1] + target[1] - current[1])
+                    win.geometry(self._fmt_pos(*pos))
+                    seen = current
+        if tries > 0:
+            win.after(30, self._settle, win, pos, seen, tries - 1)
+
+    def _centered_over_root(self, width, height):
+        root = self.root
+        left, top = root.winfo_vrootx(), root.winfo_vrooty()
+        right = left + (root.winfo_vrootwidth() or root.winfo_screenwidth())
+        bottom = top + (root.winfo_vrootheight() or root.winfo_screenheight())
+        if root.state() == "normal" and root.winfo_viewable():
+            x = root.winfo_rootx() + (root.winfo_width() - width) // 2
+            y = root.winfo_rooty() + (root.winfo_height() - height) // 2
+        else:
+            x = left + (right - left - width) // 2
+            y = top + (bottom - top - height) // 2
+        return max(left, min(x, right - width)), max(top, min(y, bottom - height))
+
+    def _grab(self, win, tries=20):
+        if not self._alive(win):
+            return
+        try:
+            win.grab_set()
+        except tk.TclError:
+            if tries > 0:
+                win.after(25, self._grab, win, tries - 1)
+
+    def apply_native_theme(self):
+        set_menu_dark(self.is_dark)
+        set_titlebar_dark(self.root, self.is_dark)
+        for child in self.root.winfo_children():
+            if isinstance(child, tk.Toplevel):
+                set_titlebar_dark(child, self.is_dark)
 
     def _combo(self, parent, values, current, handler):
         combo = ttk.Combobox(parent, values=list(values), state="readonly", width=1)
@@ -3403,6 +3509,7 @@ class App:
         resolved = detect_system_theme() if self.theme_selection == "Auto" else self.theme_selection
         t = THEMES.get(resolved, THEMES["Dark Slate"])
         self.bg_color = t["bg"]
+        self.is_dark = is_dark_color(t["bg"])
         self.fg_color = t["fg"]
         self.entry_bg = t["entry_bg"]
         self.border_color = t["border"]
@@ -3505,6 +3612,7 @@ class App:
             except tk.TclError:
                 pass
         self._themed = alive
+        self.apply_native_theme()
         self.refresh_status()
 
     def save_config(self):

@@ -2,6 +2,15 @@
 
 All notable changes to Intool are documented in this file.
 
+## [1.1.1] - 2026-11-25
+
+Compare: [v1.1.0...v1.1.1](https://github.com/asard6348/intool/compare/v1.1.0...v1.1.1)
+
+### Fixed
+
+- **Dark theme on Windows.** The title bar of the main window and of every other window, and the tray menu, now follow the chosen theme instead of staying white. They update at once when the theme is changed in Settings.
+- **Window placement.** Settings, Extra Hotkeys, Recording Settings, System and message windows now open centred over the main window instead of in the top-left corner of the screen, on Windows and Linux. They stay on screen, and are centred on the screen when the main window is minimized or hidden in the tray.
+
 ## [1.1.0] - 2026-11-01
 
 Compare: [v1.0.0...v1.1.0](https://github.com/asard6348/intool/compare/v1.0.0...v1.1.0)
@@ -62,5 +71,6 @@ First release.
 - Linux (`uinput`, `xtest` and root helper backends) and Windows builds.
 - MIT license.
 
+[1.1.1]: https://github.com/asard6348/intool/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/asard6348/intool/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/asard6348/intool/releases/tag/v1.0.0

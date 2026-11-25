@@ -1175,6 +1175,22 @@ class TrayTests(unittest.TestCase):
         self.assertTrue(icon.stopped)
         self.assertIsNone(tray.icon)
 
+    def test_menu_theme_is_applied_before_the_icon_is_created(self):
+        order = []
+        with mock.patch.object(intool, "set_menu_dark", side_effect=lambda dark: order.append(("menu", dark))):
+            pystray, image, draw = self.backend()
+            pystray.Icon = lambda *args: order.append(("icon",)) or self.FakeIcon(*args)
+            tray = intool.Tray(None, None, None, loader=lambda: (pystray, image, draw), dark=lambda: True)
+            self.assertTrue(tray.show())
+            tray.show()
+        self.assertEqual(order, [("menu", True), ("icon",)])
+
+    def test_menu_theme_is_left_alone_without_a_theme_source(self):
+        with mock.patch.object(intool, "set_menu_dark") as menus:
+            tray = intool.Tray(None, None, None, loader=self.backend)
+            tray.show()
+        menus.assert_not_called()
+
     def test_a_failing_backend_falls_back_cleanly(self):
         class Broken(self.FakeIcon):
             def run_detached(self):
@@ -1188,6 +1204,92 @@ class TrayTests(unittest.TestCase):
     def test_missing_modules_make_the_loader_return_none(self):
         with mock.patch.dict("sys.modules", {"pystray": None}):
             self.assertIsNone(intool.load_tray_backend())
+
+
+class NativeThemeTests(unittest.TestCase):
+    def libraries(self, parent_result=7, dwm_results=(0,)):
+        user32, dwmapi = mock.MagicMock(), mock.MagicMock()
+        user32.GetParent.return_value = parent_result
+        dwmapi.DwmSetWindowAttribute.side_effect = list(dwm_results)
+        return user32, dwmapi, lambda name: {"user32": user32, "dwmapi": dwmapi}[name]
+
+    def window(self):
+        window = mock.MagicMock()
+        window.winfo_id.return_value = 42
+        return window
+
+    def test_dark_colours_are_told_from_light_ones(self):
+        self.assertTrue(intool.is_dark_color("#101216"))
+        self.assertTrue(intool.is_dark_color("#000000"))
+        self.assertFalse(intool.is_dark_color("#f0f2f5"))
+        self.assertFalse(intool.is_dark_color("#ffffff"))
+        self.assertTrue(intool.is_dark_color("nonsense"))
+        self.assertTrue(intool.is_dark_color(None))
+
+    def test_every_theme_is_classified(self):
+        self.assertTrue(intool.is_dark_color(intool.THEMES["Dark Slate"]["bg"]))
+        self.assertTrue(intool.is_dark_color(intool.THEMES["OLED Black"]["bg"]))
+        self.assertFalse(intool.is_dark_color(intool.THEMES["Light Slate"]["bg"]))
+
+    def test_nothing_happens_off_windows(self):
+        with mock.patch.object(intool, "IS_WIN", False), \
+                mock.patch.object(intool.ctypes, "WinDLL", create=True) as loader:
+            intool.set_titlebar_dark(self.window(), True)
+            intool.set_menu_dark(True)
+        loader.assert_not_called()
+
+    def test_titlebar_is_made_dark_on_the_frame_window(self):
+        user32, dwmapi, loader = self.libraries()
+        window = self.window()
+        with mock.patch.object(intool, "IS_WIN", True), \
+                mock.patch.object(intool.ctypes, "WinDLL", create=True, side_effect=loader):
+            intool.set_titlebar_dark(window, True)
+        user32.GetParent.assert_called_once_with(42)
+        dwmapi.DwmSetWindowAttribute.assert_called_once()
+        frame, attribute, value, size = dwmapi.DwmSetWindowAttribute.call_args.args
+        self.assertEqual((frame, attribute, size), (7, 20, 4))
+        self.assertEqual(value._obj.value, 1)
+        user32.SetWindowPos.assert_called_once_with(7, None, 0, 0, 0, 0, 0x37)
+
+    def test_titlebar_can_be_made_light_again(self):
+        user32, dwmapi, loader = self.libraries()
+        with mock.patch.object(intool, "IS_WIN", True), \
+                mock.patch.object(intool.ctypes, "WinDLL", create=True, side_effect=loader):
+            intool.set_titlebar_dark(self.window(), False)
+        self.assertEqual(dwmapi.DwmSetWindowAttribute.call_args.args[2]._obj.value, 0)
+
+    def test_older_windows_builds_fall_back_to_the_earlier_attribute(self):
+        user32, dwmapi, loader = self.libraries(dwm_results=(87, 0))
+        with mock.patch.object(intool, "IS_WIN", True), \
+                mock.patch.object(intool.ctypes, "WinDLL", create=True, side_effect=loader):
+            intool.set_titlebar_dark(self.window(), True)
+        self.assertEqual([call.args[1] for call in dwmapi.DwmSetWindowAttribute.call_args_list], [20, 19])
+
+    def test_the_window_itself_is_used_when_it_has_no_parent(self):
+        user32, dwmapi, loader = self.libraries(parent_result=0)
+        with mock.patch.object(intool, "IS_WIN", True), \
+                mock.patch.object(intool.ctypes, "WinDLL", create=True, side_effect=loader):
+            intool.set_titlebar_dark(self.window(), True)
+        self.assertEqual(dwmapi.DwmSetWindowAttribute.call_args.args[0], 42)
+
+    def test_titlebar_failures_are_swallowed(self):
+        with mock.patch.object(intool, "IS_WIN", True), \
+                mock.patch.object(intool.ctypes, "WinDLL", create=True, side_effect=OSError("no dwm")):
+            intool.set_titlebar_dark(self.window(), True)
+            intool.set_menu_dark(True)
+
+    def test_menus_are_forced_dark_or_light_and_flushed(self):
+        functions = {135: mock.MagicMock(), 136: mock.MagicMock()}
+        uxtheme = mock.MagicMock()
+        uxtheme.__getitem__.side_effect = lambda ordinal: functions[ordinal]
+        with mock.patch.object(intool, "IS_WIN", True), \
+                mock.patch.object(intool.ctypes, "WinDLL", create=True, return_value=uxtheme):
+            intool.set_menu_dark(True)
+            functions[135].assert_called_with(2)
+            functions[136].assert_called_once_with()
+            intool.set_menu_dark(False)
+            functions[135].assert_called_with(3)
+        self.assertEqual(functions[136].call_count, 2)
 
 
 class RecorderModeTests(unittest.TestCase):
@@ -2497,6 +2599,88 @@ class GuiSmokeTests(unittest.TestCase):
         self.app.restore_window()
         self.assertEqual(hidden, [True])
         self.assertEqual(self.app.root.wm_state(), "normal")
+
+    def pump(self):
+        for _ in range(16):
+            self.root.update()
+            time.sleep(0.03)
+
+    def centre_of(self, widget):
+        return widget.winfo_rootx() + widget.winfo_width() / 2, widget.winfo_rooty() + widget.winfo_height() / 2
+
+    def test_dialogs_open_centred_over_the_main_window(self):
+        self.root.geometry("+120+90")
+        self.root.update()
+        for opener in (lambda: self.app.show_message("Info", "hello"), self.app.open_system,
+                       self.app.open_bindings, self.app.open_recording_settings):
+            opener()
+        self.pump()
+        wins = self.open_windows()
+        self.assertEqual(len(wins), 4)
+        cx, cy = self.centre_of(self.root)
+        for win in wins:
+            with self.subTest(title=win.title()):
+                self.assertEqual(win.wm_state(), "normal")
+                wx, wy = self.centre_of(win)
+                self.assertLessEqual(abs(wx - cx), 3)
+                self.assertLessEqual(abs(wy - cy), 3)
+
+    def test_dialogs_stay_inside_the_screen(self):
+        self.root.geometry("+0+0")
+        self.root.update()
+        self.app.open_settings()
+        self.pump()
+        win = self.open_windows()[0]
+        self.assertGreaterEqual(win.winfo_rootx(), 0)
+        self.assertGreaterEqual(win.winfo_rooty(), 0)
+
+    def test_dialogs_centre_on_the_screen_when_the_main_window_is_hidden(self):
+        self.root.withdraw()
+        self.root.update()
+        self.app.show_message("Info", "hello")
+        self.pump()
+        win = self.open_windows()[0]
+        wx, wy = self.centre_of(win)
+        self.assertLessEqual(abs(wx - self.root.winfo_vrootwidth() / 2), 3)
+        self.assertLessEqual(abs(wy - self.root.winfo_vrootheight() / 2), 3)
+
+    def test_modal_message_grabs_input_once_shown(self):
+        self.app.show_message("Info", "hello")
+        self.pump()
+        self.assertIs(self.root.grab_current(), self.open_windows()[0])
+
+    def test_titlebar_follows_the_theme_for_the_main_and_dialog_windows(self):
+        self.app.show_message("Info", "hello")
+        self.pump()
+        win = self.open_windows()[0]
+        with mock.patch.object(intool, "set_titlebar_dark") as titlebar, \
+                mock.patch.object(intool, "set_menu_dark") as menus:
+            self.app.theme_selection = "Light Slate"
+            self.app.update_ui_theme()
+            self.assertIn(mock.call(self.root, False), titlebar.call_args_list)
+            self.assertIn(mock.call(win, False), titlebar.call_args_list)
+            menus.assert_called_with(False)
+            titlebar.reset_mock()
+            self.app.theme_selection = "OLED Black"
+            self.app.update_ui_theme()
+            self.assertIn(mock.call(self.root, True), titlebar.call_args_list)
+            menus.assert_called_with(True)
+
+    def test_new_dialogs_get_the_current_titlebar_theme(self):
+        self.app.theme_selection = "Light Slate"
+        self.app.update_ui_theme()
+        with mock.patch.object(intool, "set_titlebar_dark") as titlebar:
+            self.app.show_message("Info", "hello")
+            self.pump()
+        self.assertEqual([call.args[1] for call in titlebar.call_args_list], [False])
+
+    def test_tray_menu_follows_the_theme(self):
+        self.app.theme_selection = "Dark Slate"
+        self.app.update_ui_theme()
+        self.assertTrue(self.app.tray.dark())
+        self.app.theme_selection = "Light Slate"
+        self.app.update_ui_theme()
+        self.assertFalse(self.app.tray.dark())
 
     def open_windows(self):
         return [w for w in self.root.winfo_children() if isinstance(w, intool.tk.Toplevel)]
